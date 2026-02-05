@@ -50,9 +50,10 @@ export async function validateApiKey(keyType: ApiKeyType, apiKey: string): Promi
 // Whisper commands
 export async function transcribeAudio(
   audioPath: string,
-  modelName: string
+  modelName: string,
+  removeFillerWords?: boolean
 ): Promise<TranscriptionResult> {
-  return invoke<TranscriptionResult>('transcribe_audio', { audioPath, modelName });
+  return invoke<TranscriptionResult>('transcribe_audio', { audioPath, modelName, removeFillerWords });
 }
 
 export async function downloadWhisperModel(modelName: string): Promise<string> {
@@ -115,4 +116,9 @@ export function getApiKeyTypeForProvider(provider: TranslationProvider): ApiKeyT
     case 'ollama':
       return null; // Ollama doesn't need an API key
   }
+}
+
+// Clipboard commands
+export async function copyAndPaste(text: string): Promise<void> {
+  return invoke('copy_and_paste', { text });
 }

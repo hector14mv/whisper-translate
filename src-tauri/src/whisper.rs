@@ -1,3 +1,4 @@
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
@@ -111,6 +112,8 @@ pub async fn download_whisper_model(model_name: String) -> Result<String, String
 pub async fn transcribe_audio(
     audio_path: String,
     model_name: String,
+    #[allow(unused_variables)]
+    remove_filler_words: Option<bool>,
 ) -> Result<TranscriptionResult, String> {
     let model_path = get_model_path(&model_name)?;
 
@@ -157,7 +160,15 @@ pub async fn transcribe_audio(
         }
     }
 
-    let text = text.trim().to_string();
+    let mut text = text.trim().to_string();
+
+    // Always remove Whisper artifacts like [silence], [music], etc.
+    text = remove_whisper_artifacts(&text);
+
+    // Remove filler words if requested
+    if remove_filler_words.unwrap_or(false) {
+        text = remove_filler_words_from_text(&text);
+    }
 
     // Try to detect the language (simplified - Whisper does this automatically)
     let detected_language = detect_language(&text);
@@ -268,4 +279,71 @@ fn detect_language(text: &str) -> String {
     } else {
         "en".to_string()
     }
+}
+
+/// Remove Whisper artifacts like [silence], [music], [door closing], etc.
+fn remove_whisper_artifacts(text: &str) -> String {
+    // Remove bracketed annotations that Whisper adds
+    let artifact_pattern = Regex::new(r"\[[^\]]*\]").unwrap();
+    let result = artifact_pattern.replace_all(text, "").to_string();
+
+    // Clean up multiple spaces
+    let multi_space = Regex::new(r"\s{2,}").unwrap();
+    multi_space.replace_all(&result, " ").trim().to_string()
+}
+
+/// Remove filler words from transcribed text (multilingual)
+fn remove_filler_words_from_text(text: &str) -> String {
+    // Filler words in multiple languages
+    // English: um, uh, er, ah, like, you know, i mean, sort of, kind of, basically, actually, literally, hmm, eh
+    // Spanish: este, o sea, pues, bueno, eh, mmm
+    // French: euh, ben, genre, en fait
+    // German: ähm, äh, also, halt, sozusagen
+    let filler_patterns = [
+        // English fillers (standalone words)
+        r"\b(um+|uh+|er+|ah+|hmm+|eh+|mhm+)\b",
+        r"\b(like)\b(?!\s+(?:a|to|the|this|that|it|when|if|because))",  // "like" only when standalone filler
+        r"\byou know\b",
+        r"\bi mean\b",
+        r"\bsort of\b",
+        r"\bkind of\b",
+        r"\bbasically\b",
+        r"\bactually\b",
+        r"\bliterally\b",
+        // Spanish fillers
+        r"\b(este|esto)\b(?!\s+\w)",  // "este" only when standalone
+        r"\bo sea\b",
+        r"\bpues\b(?!\s+(?:sí|no|bien|claro))",  // "pues" when not part of phrase
+        r"\bbueno\b(?!\s+(?:día|días))",  // "bueno" when not "buenos días"
+        // French fillers
+        r"\beuh+\b",
+        r"\bben\b",
+        r"\bgenre\b(?!\s+de)",  // "genre" when not "genre de"
+        r"\ben fait\b",
+        // German fillers
+        r"\b(ähm+|äh+)\b",
+        r"\balso\b(?!\s+(?:gut|dann|wenn))",  // "also" when standalone
+        r"\bhalt\b",
+        r"\bsozusagen\b",
+    ];
+
+    let mut result = text.to_string();
+
+    for pattern in &filler_patterns {
+        if let Ok(re) = Regex::new(&format!("(?i){}", pattern)) {
+            result = re.replace_all(&result, "").to_string();
+        }
+    }
+
+    // Clean up multiple spaces and trim
+    if let Ok(multi_space) = Regex::new(r"\s{2,}") {
+        result = multi_space.replace_all(&result, " ").to_string();
+    }
+
+    // Clean up punctuation spacing (e.g., " ," -> ",")
+    if let Ok(punct_space) = Regex::new(r"\s+([,\.!\?])") {
+        result = punct_space.replace_all(&result, "$1").to_string();
+    }
+
+    result.trim().to_string()
 }

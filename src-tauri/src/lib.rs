@@ -4,12 +4,18 @@ mod providers;
 mod translate;
 mod whisper;
 
+use arboard::Clipboard;
 use providers::{ModelInfo, ProviderConfig, TranslationProvider};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::State;
+
+#[cfg(target_os = "macos")]
+use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode};
+#[cfg(target_os = "macos")]
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
 /// Application state shared across commands
 pub struct AppState {
@@ -50,10 +56,28 @@ pub struct AppSettings {
     pub translation_model: Option<String>, // Optional model override
     #[serde(default = "default_translation_enabled")]
     pub translation_enabled: bool,        // Enable/disable translation (transcription-only mode)
+    #[serde(default = "default_remove_filler_words")]
+    pub remove_filler_words: bool,        // Remove um, uh, like, etc. from transcriptions
+    #[serde(default = "default_global_hotkey_enabled")]
+    pub global_hotkey_enabled: bool,      // Enable system-wide hotkey for recording
+    #[serde(default = "default_global_hotkey")]
+    pub global_hotkey: String,            // The hotkey combination (e.g., "CommandOrControl+Shift+Space")
 }
 
 fn default_translation_enabled() -> bool {
     true
+}
+
+fn default_remove_filler_words() -> bool {
+    false
+}
+
+fn default_global_hotkey_enabled() -> bool {
+    false
+}
+
+fn default_global_hotkey() -> String {
+    "CommandOrControl+Shift+Space".to_string()
 }
 
 impl Default for AppSettings {
@@ -66,6 +90,9 @@ impl Default for AppSettings {
             translation_provider: "openai".to_string(), // Default to GPT-4o-mini (cheapest)
             translation_model: None,
             translation_enabled: true,
+            remove_filler_words: false,
+            global_hotkey_enabled: false,
+            global_hotkey: "CommandOrControl+Shift+Space".to_string(),
         }
     }
 }
@@ -239,12 +266,68 @@ pub struct OllamaStatus {
     pub error: Option<String>,
 }
 
+/// Copy text to clipboard and simulate paste (Cmd+V on macOS)
+#[tauri::command]
+async fn copy_and_paste(text: String) -> Result<(), String> {
+    // Copy to clipboard
+    let mut clipboard = Clipboard::new().map_err(|e| format!("Failed to access clipboard: {}", e))?;
+    clipboard.set_text(&text).map_err(|e| format!("Failed to copy to clipboard: {}", e))?;
+
+    // Small delay to ensure clipboard is ready
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Simulate Cmd+V paste
+    #[cfg(target_os = "macos")]
+    {
+        simulate_paste_macos().map_err(|e| format!("Failed to paste: {}", e))?;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err("Auto-paste only supported on macOS".to_string());
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn simulate_paste_macos() -> Result<(), String> {
+    // Key code for 'V' on macOS
+    const V_KEY: CGKeyCode = 9;
+
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| "Failed to create event source")?;
+
+    // Create key down event for 'V'
+    let key_down = CGEvent::new_keyboard_event(source.clone(), V_KEY, true)
+        .map_err(|_| "Failed to create key down event")?;
+
+    // Create key up event for 'V'
+    let key_up = CGEvent::new_keyboard_event(source, V_KEY, false)
+        .map_err(|_| "Failed to create key up event")?;
+
+    // Set Command flag (Cmd+V)
+    key_down.set_flags(CGEventFlags::CGEventFlagCommand);
+    key_up.set_flags(CGEventFlags::CGEventFlagCommand);
+
+    // Post the events
+    key_down.post(CGEventTapLocation::HID);
+
+    // Small delay between key down and up
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    key_up.post(CGEventTapLocation::HID);
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::init();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             // Audio commands
@@ -269,6 +352,8 @@ pub fn run() {
             // Settings commands
             get_settings,
             save_settings,
+            // Clipboard commands
+            copy_and_paste,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

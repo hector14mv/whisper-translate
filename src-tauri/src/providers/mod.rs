@@ -28,7 +28,7 @@ impl TranslationProvider {
             TranslationProvider::Anthropic => "claude-3-5-haiku-20241022",
             TranslationProvider::OpenAI => "gpt-4o-mini",
             TranslationProvider::Google => "gemini-1.5-flash",
-            TranslationProvider::Ollama => "llama3.2",
+            TranslationProvider::Ollama => "qwen2.5",
         }
     }
 
@@ -73,19 +73,19 @@ impl TranslationProvider {
             ],
             TranslationProvider::Ollama => vec![
                 ModelInfo {
+                    id: "qwen2.5".to_string(),
+                    name: "Qwen 2.5".to_string(),
+                    description: "Best for translation - excellent multilingual support".to_string(),
+                },
+                ModelInfo {
                     id: "llama3.2".to_string(),
                     name: "Llama 3.2".to_string(),
-                    description: "Fast, local".to_string(),
+                    description: "Fast, good for European languages".to_string(),
                 },
                 ModelInfo {
                     id: "mistral".to_string(),
                     name: "Mistral".to_string(),
-                    description: "Good quality, local".to_string(),
-                },
-                ModelInfo {
-                    id: "qwen2.5".to_string(),
-                    name: "Qwen 2.5".to_string(),
-                    description: "Great for Asian languages".to_string(),
+                    description: "Balanced quality and speed".to_string(),
                 },
             ],
         }

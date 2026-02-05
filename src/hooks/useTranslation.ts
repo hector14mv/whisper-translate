@@ -13,7 +13,8 @@ interface UseTranslationReturn {
     targetLanguage: string,
     provider: TranslationProvider,
     model?: string,
-    translationEnabled?: boolean
+    translationEnabled?: boolean,
+    removeFillerWords?: boolean
   ) => Promise<TranslationEntry | null>;
   clearResults: () => void;
 }
@@ -30,15 +31,16 @@ export function useTranslation(): UseTranslationReturn {
     targetLanguage: string,
     provider: TranslationProvider,
     model?: string,
-    translationEnabled: boolean = true
+    translationEnabled: boolean = true,
+    removeFillerWords: boolean = false
   ): Promise<TranslationEntry | null> => {
     setIsProcessing(true);
     setError(null);
     setTranslation(null); // Clear previous translation
 
     try {
-      // Step 1: Transcribe the audio
-      const transcriptionResult = await transcribeAudio(audioPath, whisperModel);
+      // Step 1: Transcribe the audio (with optional filler word removal)
+      const transcriptionResult = await transcribeAudio(audioPath, whisperModel, removeFillerWords);
       setTranscription(transcriptionResult);
 
       if (!transcriptionResult.text.trim()) {
