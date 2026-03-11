@@ -1,6 +1,9 @@
+use futures::StreamExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::PathBuf;
+use tauri::{AppHandle, Emitter};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 /// Whisper model information
@@ -37,9 +40,8 @@ fn is_model_downloaded(model_name: &str) -> Result<bool, String> {
 #[tauri::command]
 pub fn get_whisper_model_status() -> Result<Vec<WhisperModelInfo>, String> {
     let models = vec![
-        ("small", 466),  // ~466 MB
-        ("medium", 1500), // ~1.5 GB
-        ("large", 2900), // ~2.9 GB
+        ("large-v3-turbo", 1549),   // ~1.55 GB - best speed/quality balance
+        ("large-v3", 2951),         // ~2.95 GB - highest quality
     ];
 
     let mut result = Vec::new();
@@ -61,10 +63,19 @@ pub fn get_whisper_model_status() -> Result<Vec<WhisperModelInfo>, String> {
     Ok(result)
 }
 
+/// Download progress event payload
+#[derive(Debug, Clone, Serialize)]
+struct DownloadProgress {
+    model: String,
+    downloaded: u64,
+    total: u64,
+    percent: f32,
+}
+
 /// Download a Whisper model from Hugging Face
-#[tauri::command]
-pub async fn download_whisper_model(model_name: String) -> Result<String, String> {
-    let valid_models = ["small", "medium", "large"];
+#[tauri::command(rename_all = "camelCase")]
+pub async fn download_whisper_model(model_name: String, app_handle: AppHandle) -> Result<String, String> {
+    let valid_models = ["large-v3-turbo", "large-v3"];
     if !valid_models.contains(&model_name.as_str()) {
         return Err(format!("Invalid model name: {}", model_name));
     }
@@ -95,20 +106,41 @@ pub async fn download_whisper_model(model_name: String) -> Result<String, String
         ));
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed to read model data: {}", e))?;
+    let total_size = response.content_length().unwrap_or(0);
+    let mut downloaded: u64 = 0;
 
-    std::fs::write(&model_path, bytes)
-        .map_err(|e| format!("Failed to write model file: {}", e))?;
+    let mut file = std::fs::File::create(&model_path)
+        .map_err(|e| format!("Failed to create model file: {}", e))?;
+
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Failed to read chunk: {}", e))?;
+        file.write_all(&chunk)
+            .map_err(|e| format!("Failed to write chunk: {}", e))?;
+
+        downloaded += chunk.len() as u64;
+
+        let percent = if total_size > 0 {
+            (downloaded as f32 / total_size as f32) * 100.0
+        } else {
+            0.0
+        };
+
+        let _ = app_handle.emit("download-progress", DownloadProgress {
+            model: model_name.clone(),
+            downloaded,
+            total: total_size,
+            percent,
+        });
+    }
 
     log::info!("Model downloaded to: {:?}", model_path);
     Ok(model_path.to_string_lossy().to_string())
 }
 
 /// Transcribe audio file using Whisper
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn transcribe_audio(
     audio_path: String,
     model_name: String,
@@ -121,15 +153,22 @@ pub async fn transcribe_audio(
         return Err(format!("Model {} not downloaded", model_name));
     }
 
+    let total_start = std::time::Instant::now();
+
     // Load the Whisper model
+    let t0 = std::time::Instant::now();
     let ctx = WhisperContext::new_with_params(
         model_path.to_str().unwrap(),
         WhisperContextParameters::default(),
     )
     .map_err(|e| format!("Failed to load Whisper model: {}", e))?;
+    log::info!("[TIMING] Model load: {:?}", t0.elapsed());
 
     // Read the audio file
+    let t0 = std::time::Instant::now();
     let audio_data = read_wav_file(&audio_path)?;
+    let duration_secs = audio_data.len() as f32 / 16000.0;
+    log::info!("[TIMING] WAV read: {:?} ({:.1}s of audio, {} samples)", t0.elapsed(), duration_secs, audio_data.len());
 
     // Create Whisper parameters
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
@@ -145,19 +184,38 @@ pub async fn transcribe_audio(
     // Create state and run inference
     let mut state = ctx.create_state().map_err(|e| format!("Failed to create state: {}", e))?;
 
+    let t0 = std::time::Instant::now();
     state
         .full(params, &audio_data)
         .map_err(|e| format!("Transcription failed: {}", e))?;
+    log::info!("[TIMING] Whisper inference: {:?}", t0.elapsed());
 
     // Get the transcribed text
-    let num_segments = state.full_n_segments().map_err(|e| format!("Failed to get segments: {}", e))?;
+    let num_segments = state.full_n_segments();
     let mut text = String::new();
 
     for i in 0..num_segments {
-        if let Ok(segment) = state.full_get_segment_text(i) {
-            text.push_str(&segment);
-            text.push(' ');
+        if let Some(segment) = state.get_segment(i) {
+            let no_speech = segment.no_speech_probability();
+            if let Ok(segment_text) = segment.to_str_lossy() {
+                log::info!("[WHISPER] Segment {}: no_speech={:.3}, text=\"{}\"", i, no_speech, segment_text.trim());
+                // Skip segments that are likely silence/hallucination
+                if no_speech > 0.6 {
+                    log::info!("[WHISPER] Skipping segment {} (no_speech too high)", i);
+                    continue;
+                }
+                text.push_str(&segment_text);
+                text.push(' ');
+            }
         }
+    }
+
+    // Check audio RMS to detect total silence (e.g. mic permission denied = 0.0)
+    let rms: f32 = (audio_data.iter().map(|s| s * s).sum::<f32>() / audio_data.len() as f32).sqrt();
+    log::info!("[WHISPER] Audio RMS: {:.6}", rms);
+    if rms < 0.0001 {
+        log::warn!("[WHISPER] Audio is silence (RMS={:.6}), mic may not be working", rms);
+        text.clear();
     }
 
     let mut text = text.trim().to_string();
@@ -174,7 +232,8 @@ pub async fn transcribe_audio(
     let detected_language = detect_language(&text);
 
     log::info!(
-        "Transcription complete: {} chars, detected language: {}",
+        "[TIMING] Total transcription: {:?} | {} chars, detected language: {}",
+        total_start.elapsed(),
         text.len(),
         detected_language
     );

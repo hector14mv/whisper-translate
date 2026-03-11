@@ -10,8 +10,8 @@ export interface TranslationEntry {
 export type TranslationProvider = 'anthropic' | 'openai' | 'google' | 'ollama';
 
 export interface AppSettings {
-  recording_mode: 'push_to_talk' | 'click_to_record';
-  whisper_model: 'small' | 'medium' | 'large';
+  recording_mode: 'push_to_talk' | 'click_to_record' | 'double_tap';
+  whisper_model: 'large-v3-turbo' | 'large-v3';
   source_language: string;
   target_language: string;
   translation_provider: TranslationProvider;
@@ -20,7 +20,10 @@ export interface AppSettings {
   remove_filler_words: boolean;
   global_hotkey_enabled: boolean;
   global_hotkey: string;
+  double_tap_interval: number;
 }
+
+export type OverlayState = 'recording' | 'processing' | 'hidden';
 
 // Available global hotkey options
 export const GLOBAL_HOTKEY_OPTIONS = [

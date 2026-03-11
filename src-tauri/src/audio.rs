@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::AppState;
 
@@ -57,7 +57,7 @@ fn get_default_input_device() -> Result<Device, String> {
 
 /// Start audio recording
 #[tauri::command]
-pub fn start_recording(state: State<AppState>) -> Result<String, String> {
+pub fn start_recording(state: State<AppState>, app_handle: AppHandle) -> Result<String, String> {
     // Check if already recording
     {
         let is_recording = state.is_recording.lock().unwrap();
@@ -74,6 +74,9 @@ pub fn start_recording(state: State<AppState>) -> Result<String, String> {
 
     // Create channel for stop signal
     let (stop_tx, stop_rx) = mpsc::channel::<RecordingCommand>();
+
+    // Clone app handle for the recording thread
+    let app_handle_clone = app_handle.clone();
 
     // Spawn recording thread
     let thread_handle = thread::spawn(move || -> Result<(), String> {
@@ -92,8 +95,10 @@ pub fn start_recording(state: State<AppState>) -> Result<String, String> {
             sample_format
         );
 
+        // Calculate RMS threshold: emit every sample_rate/30 samples (~33ms for 30fps)
+        let rms_interval = (config.sample_rate.0 / 30) as usize;
+
         // Create WAV writer with the device's native config
-        // We'll record at native sample rate and let Whisper handle resampling
         let spec = WavSpec {
             channels: 1, // We'll convert to mono
             sample_rate: config.sample_rate.0,
@@ -110,24 +115,44 @@ pub fn start_recording(state: State<AppState>) -> Result<String, String> {
         let sample_count = Arc::new(Mutex::new(0usize));
         let sample_count_for_callback = sample_count.clone();
 
+        // RMS accumulation state
+        let rms_sum = Arc::new(Mutex::new(0.0f64));
+        let rms_count = Arc::new(Mutex::new(0usize));
+
         let err_fn = |err| log::error!("Audio stream error: {}", err);
 
         let stream = match sample_format {
             SampleFormat::F32 => {
                 let writer = writer_for_callback.clone();
                 let sc = sample_count_for_callback.clone();
+                let rms_s = rms_sum.clone();
+                let rms_c = rms_count.clone();
+                let ah = app_handle_clone.clone();
                 device.build_input_stream(
                     &config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
                         if let Ok(mut guard) = writer.lock() {
                             if let Some(ref mut w) = *guard {
-                                // Convert to mono by averaging channels
                                 for chunk in data.chunks(channels) {
                                     let sum: f32 = chunk.iter().sum();
                                     let mono_sample = sum / channels as f32;
                                     let sample_i16 =
                                         (mono_sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
                                     let _ = w.write_sample(sample_i16);
+
+                                    // Accumulate for RMS
+                                    if let (Ok(mut rs), Ok(mut rc)) = (rms_s.lock(), rms_c.lock()) {
+                                        *rs += (mono_sample as f64) * (mono_sample as f64);
+                                        *rc += 1;
+
+                                        if *rc >= rms_interval {
+                                            let rms = (*rs / *rc as f64).sqrt() as f32;
+                                            let level = (rms * 5.0).clamp(0.0, 1.0);
+                                            let _ = ah.emit("audio-level", level);
+                                            *rs = 0.0;
+                                            *rc = 0;
+                                        }
+                                    }
                                 }
                                 if let Ok(mut count) = sc.lock() {
                                     *count += data.len() / channels;
@@ -141,16 +166,33 @@ pub fn start_recording(state: State<AppState>) -> Result<String, String> {
             }
             SampleFormat::I16 => {
                 let writer = writer_for_callback.clone();
+                let rms_s = rms_sum.clone();
+                let rms_c = rms_count.clone();
+                let ah = app_handle_clone.clone();
                 device.build_input_stream(
                     &config,
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
                         if let Ok(mut guard) = writer.lock() {
                             if let Some(ref mut w) = *guard {
-                                // Convert to mono by averaging channels
                                 for chunk in data.chunks(channels) {
                                     let sum: i32 = chunk.iter().map(|&s| s as i32).sum();
                                     let mono_sample = (sum / channels as i32) as i16;
                                     let _ = w.write_sample(mono_sample);
+
+                                    // Accumulate for RMS (normalize to -1.0..1.0)
+                                    let normalized = mono_sample as f64 / 32768.0;
+                                    if let (Ok(mut rs), Ok(mut rc)) = (rms_s.lock(), rms_c.lock()) {
+                                        *rs += normalized * normalized;
+                                        *rc += 1;
+
+                                        if *rc >= rms_interval {
+                                            let rms = (*rs / *rc as f64).sqrt() as f32;
+                                            let level = (rms * 5.0).clamp(0.0, 1.0);
+                                            let _ = ah.emit("audio-level", level);
+                                            *rs = 0.0;
+                                            *rc = 0;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -161,16 +203,33 @@ pub fn start_recording(state: State<AppState>) -> Result<String, String> {
             }
             SampleFormat::U16 => {
                 let writer = writer_for_callback.clone();
+                let rms_s = rms_sum.clone();
+                let rms_c = rms_count.clone();
+                let ah = app_handle_clone.clone();
                 device.build_input_stream(
                     &config,
                     move |data: &[u16], _: &cpal::InputCallbackInfo| {
                         if let Ok(mut guard) = writer.lock() {
                             if let Some(ref mut w) = *guard {
-                                // Convert to mono by averaging channels
                                 for chunk in data.chunks(channels) {
                                     let sum: i32 = chunk.iter().map(|&s| s as i32 - 32768).sum();
                                     let mono_sample = (sum / channels as i32) as i16;
                                     let _ = w.write_sample(mono_sample);
+
+                                    // Accumulate for RMS (normalize to -1.0..1.0)
+                                    let normalized = mono_sample as f64 / 32768.0;
+                                    if let (Ok(mut rs), Ok(mut rc)) = (rms_s.lock(), rms_c.lock()) {
+                                        *rs += normalized * normalized;
+                                        *rc += 1;
+
+                                        if *rc >= rms_interval {
+                                            let rms = (*rs / *rc as f64).sqrt() as f32;
+                                            let level = (rms * 5.0).clamp(0.0, 1.0);
+                                            let _ = ah.emit("audio-level", level);
+                                            *rs = 0.0;
+                                            *rc = 0;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -181,18 +240,34 @@ pub fn start_recording(state: State<AppState>) -> Result<String, String> {
             }
             SampleFormat::I32 => {
                 let writer = writer_for_callback.clone();
+                let rms_s = rms_sum.clone();
+                let rms_c = rms_count.clone();
+                let ah = app_handle_clone.clone();
                 device.build_input_stream(
                     &config,
                     move |data: &[i32], _: &cpal::InputCallbackInfo| {
                         if let Ok(mut guard) = writer.lock() {
                             if let Some(ref mut w) = *guard {
-                                // Convert to mono by averaging channels
                                 for chunk in data.chunks(channels) {
                                     let sum: i64 = chunk.iter().map(|&s| s as i64).sum();
                                     let mono_sample = (sum / channels as i64) as i32;
-                                    // Convert i32 to i16 by shifting
                                     let sample_i16 = (mono_sample >> 16) as i16;
                                     let _ = w.write_sample(sample_i16);
+
+                                    // Accumulate for RMS (normalize to -1.0..1.0)
+                                    let normalized = mono_sample as f64 / 2147483648.0;
+                                    if let (Ok(mut rs), Ok(mut rc)) = (rms_s.lock(), rms_c.lock()) {
+                                        *rs += normalized * normalized;
+                                        *rc += 1;
+
+                                        if *rc >= rms_interval {
+                                            let rms = (*rs / *rc as f64).sqrt() as f32;
+                                            let level = (rms * 5.0).clamp(0.0, 1.0);
+                                            let _ = ah.emit("audio-level", level);
+                                            *rs = 0.0;
+                                            *rc = 0;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -249,13 +324,16 @@ pub fn start_recording(state: State<AppState>) -> Result<String, String> {
         *is_recording = true;
     }
 
+    // Emit recording state change
+    let _ = app_handle.emit("recording-state-change", "recording");
+
     log::info!("Recording started, output: {}", output_path_str);
     Ok(output_path_str)
 }
 
 /// Stop audio recording and return the path to the recorded file
 #[tauri::command]
-pub fn stop_recording(state: State<AppState>) -> Result<String, String> {
+pub fn stop_recording(state: State<AppState>, app_handle: AppHandle) -> Result<String, String> {
     // Check if actually recording
     {
         let is_recording = state.is_recording.lock().unwrap();
@@ -285,6 +363,9 @@ pub fn stop_recording(state: State<AppState>) -> Result<String, String> {
         let mut is_recording = state.is_recording.lock().unwrap();
         *is_recording = false;
     }
+
+    // Emit recording state change
+    let _ = app_handle.emit("recording-state-change", "idle");
 
     let temp_dir = std::env::temp_dir();
     let output_path = temp_dir

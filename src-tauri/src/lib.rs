@@ -10,18 +10,17 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use tauri::State;
+use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
-#[cfg(target_os = "macos")]
-use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode};
-#[cfg(target_os = "macos")]
-use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
 /// Application state shared across commands
 pub struct AppState {
     pub is_recording: Mutex<bool>,
     pub anthropic_api_key: Mutex<Option<String>>,
     pub whisper_model_path: Mutex<Option<String>>,
+    /// PID of the app that was frontmost when recording started
+    #[cfg(target_os = "macos")]
+    pub previous_app_pid: Mutex<Option<i32>>,
 }
 
 impl Default for AppState {
@@ -30,6 +29,8 @@ impl Default for AppState {
             is_recording: Mutex::new(false),
             anthropic_api_key: Mutex::new(None),
             whisper_model_path: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            previous_app_pid: Mutex::new(None),
         }
     }
 }
@@ -62,6 +63,8 @@ pub struct AppSettings {
     pub global_hotkey_enabled: bool,      // Enable system-wide hotkey for recording
     #[serde(default = "default_global_hotkey")]
     pub global_hotkey: String,            // The hotkey combination (e.g., "CommandOrControl+Shift+Space")
+    #[serde(default = "default_double_tap_interval")]
+    pub double_tap_interval: u32,         // Milliseconds between taps for double-tap mode
 }
 
 fn default_translation_enabled() -> bool {
@@ -80,11 +83,15 @@ fn default_global_hotkey() -> String {
     "CommandOrControl+Shift+Space".to_string()
 }
 
+fn default_double_tap_interval() -> u32 {
+    400
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             recording_mode: "click_to_record".to_string(),
-            whisper_model: "small".to_string(),
+            whisper_model: "large-v3-turbo".to_string(),
             source_language: "auto".to_string(),  // Default to auto-detect
             target_language: "en".to_string(),
             translation_provider: "openai".to_string(), // Default to GPT-4o-mini (cheapest)
@@ -93,6 +100,7 @@ impl Default for AppSettings {
             remove_filler_words: false,
             global_hotkey_enabled: false,
             global_hotkey: "CommandOrControl+Shift+Space".to_string(),
+            double_tap_interval: 400,
         }
     }
 }
@@ -106,6 +114,56 @@ pub use whisper::{download_whisper_model, get_whisper_model_status, transcribe_a
 #[tauri::command]
 fn is_recording(state: State<AppState>) -> bool {
     *state.is_recording.lock().unwrap()
+}
+
+/// Save the frontmost app PID so we can reactivate it after pasting
+#[tauri::command]
+fn save_frontmost_app(state: State<AppState>) {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe {
+            use objc::{msg_send, sel, sel_impl, class};
+
+            // Get our own PID to exclude it
+            let our_pid: i32 = std::process::id() as i32;
+
+            let workspace: cocoa::base::id = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let frontmost: cocoa::base::id = msg_send![workspace, frontmostApplication];
+            if frontmost != cocoa::base::nil {
+                let pid: i32 = msg_send![frontmost, processIdentifier];
+                if pid != our_pid {
+                    log::info!("[FOCUS] Saved frontmost app PID: {} (not us: {})", pid, our_pid);
+                    *state.previous_app_pid.lock().unwrap() = Some(pid);
+                } else {
+                    // Frontmost is us — look through running apps for the most recently active one
+                    log::info!("[FOCUS] Frontmost is us (PID {}), searching for previous app...", our_pid);
+                    let running_apps: cocoa::base::id = msg_send![workspace, runningApplications];
+                    let count: usize = msg_send![running_apps, count];
+                    for i in 0..count {
+                        let app: cocoa::base::id = msg_send![running_apps, objectAtIndex: i];
+                        let app_pid: i32 = msg_send![app, processIdentifier];
+                        let is_active: cocoa::base::BOOL = msg_send![app, isActive];
+                        let activation_policy: i64 = msg_send![app, activationPolicy];
+                        // activationPolicy 0 = regular app (has dock icon)
+                        if app_pid != our_pid && activation_policy == 0 && is_active != cocoa::base::NO {
+                            log::info!("[FOCUS] Found active app PID: {}", app_pid);
+                            *state.previous_app_pid.lock().unwrap() = Some(app_pid);
+                            return;
+                        }
+                    }
+                    // If no active app found, try menuBarOwningApplication
+                    let menu_app: cocoa::base::id = msg_send![workspace, menuBarOwningApplication];
+                    if menu_app != cocoa::base::nil {
+                        let menu_pid: i32 = msg_send![menu_app, processIdentifier];
+                        if menu_pid != our_pid {
+                            log::info!("[FOCUS] Using menu bar app PID: {}", menu_pid);
+                            *state.previous_app_pid.lock().unwrap() = Some(menu_pid);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Get the settings file path
@@ -166,7 +224,7 @@ fn save_settings(settings: AppSettings) -> Result<(), String> {
 }
 
 /// Translate text using the specified provider
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 async fn translate_text(
     text: String,
     source_language: String,
@@ -190,7 +248,10 @@ async fn translate_text(
         ollama_url: None, // Use default localhost:11434
     };
 
-    providers::translate(&config, &text, &source_language, &target_language).await
+    let t0 = std::time::Instant::now();
+    let result = providers::translate(&config, &text, &source_language, &target_language).await;
+    log::info!("[TIMING] Translation ({} via {}): {:?}", provider, config.model.as_deref().unwrap_or("default"), t0.elapsed());
+    result
 }
 
 /// Get available models for a provider
@@ -267,23 +328,80 @@ pub struct OllamaStatus {
 }
 
 /// Copy text to clipboard and simulate paste (Cmd+V on macOS)
-#[tauri::command]
-async fn copy_and_paste(text: String) -> Result<(), String> {
+#[tauri::command(rename_all = "camelCase")]
+async fn copy_and_paste(text: String, app_handle: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let t0 = std::time::Instant::now();
+    log::info!("[PASTE] Starting copy_and_paste, text length: {}", text.len());
+
     // Copy to clipboard
     let mut clipboard = Clipboard::new().map_err(|e| format!("Failed to access clipboard: {}", e))?;
     clipboard.set_text(&text).map_err(|e| format!("Failed to copy to clipboard: {}", e))?;
+    log::info!("[PASTE] Clipboard set: {:?}", t0.elapsed());
 
-    // Small delay to ensure clipboard is ready
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-    // Simulate Cmd+V paste
     #[cfg(target_os = "macos")]
     {
-        simulate_paste_macos().map_err(|e| format!("Failed to paste: {}", e))?;
+        // Hide overlay if visible
+        if let Some(window) = app_handle.get_webview_window("overlay") {
+            let _ = window.hide();
+            log::info!("[PASTE] Overlay hidden");
+        }
+
+        // Reactivate the app that was frontmost when recording started
+        let saved_pid = state.previous_app_pid.lock().unwrap().take();
+        if let Some(pid) = saved_pid {
+            log::info!("[PASTE] Reactivating app with PID: {}", pid);
+            unsafe {
+                use objc::{msg_send, sel, sel_impl, class};
+                let running_app: cocoa::base::id = msg_send![
+                    class!(NSRunningApplication),
+                    runningApplicationWithProcessIdentifier: pid
+                ];
+                if running_app != cocoa::base::nil {
+                    // NSApplicationActivateIgnoringOtherApps = 1 << 1 = 2
+                    let success: cocoa::base::BOOL = msg_send![
+                        running_app,
+                        activateWithOptions: 2u64
+                    ];
+                    log::info!("[PASTE] App activation result: {}", success);
+                } else {
+                    log::warn!("[PASTE] Could not find app with PID {}", pid);
+                }
+            }
+        } else {
+            log::warn!("[PASTE] No saved frontmost app PID, hiding NSApp as fallback");
+            unsafe {
+                use objc::{msg_send, sel, sel_impl};
+                let ns_app: cocoa::base::id = msg_send![cocoa::appkit::NSApp(), self];
+                let _: () = msg_send![ns_app, hide: cocoa::base::nil];
+            }
+        }
+        log::info!("[PASTE] Focus switch: {:?}", t0.elapsed());
+
+        // Wait for focus to settle + clipboard to propagate
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        log::info!("[PASTE] Focus wait done: {:?}", t0.elapsed());
+
+        // Check accessibility permission before attempting paste
+        extern "C" {
+            fn AXIsProcessTrusted() -> bool;
+        }
+        let is_trusted = unsafe { AXIsProcessTrusted() };
+        if !is_trusted {
+            log::error!("[PASTE] Accessibility permission not granted");
+            return Err("Accessibility permission required for auto-paste. Enable it in System Settings > Privacy & Security > Accessibility.".to_string());
+        }
+
+        // Simulate Cmd+V via enigo (requires Accessibility permission)
+        match simulate_paste_macos() {
+            Ok(_) => log::info!("[PASTE] Paste simulated: {:?}", t0.elapsed()),
+            Err(e) => log::error!("[PASTE] Paste simulation failed: {}", e),
+        }
+        log::info!("[PASTE] Complete: {:?}", t0.elapsed());
     }
 
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = app_handle;
         return Err("Auto-paste only supported on macOS".to_string());
     }
 
@@ -292,42 +410,93 @@ async fn copy_and_paste(text: String) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn simulate_paste_macos() -> Result<(), String> {
-    // Key code for 'V' on macOS
-    const V_KEY: CGKeyCode = 9;
+    use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| "Failed to create event source")?;
+    let mut enigo = Enigo::new(&Settings::default())
+        .map_err(|e| format!("Failed to create enigo: {}", e))?;
 
-    // Create key down event for 'V'
-    let key_down = CGEvent::new_keyboard_event(source.clone(), V_KEY, true)
-        .map_err(|_| "Failed to create key down event")?;
+    // Simulate Cmd+V
+    enigo.key(Key::Meta, Direction::Press)
+        .map_err(|e| format!("Failed to press Meta: {}", e))?;
+    enigo.key(Key::Unicode('v'), Direction::Click)
+        .map_err(|e| format!("Failed to click V: {}", e))?;
+    enigo.key(Key::Meta, Direction::Release)
+        .map_err(|e| format!("Failed to release Meta: {}", e))?;
 
-    // Create key up event for 'V'
-    let key_up = CGEvent::new_keyboard_event(source, V_KEY, false)
-        .map_err(|_| "Failed to create key up event")?;
+    Ok(())
+}
 
-    // Set Command flag (Cmd+V)
-    key_down.set_flags(CGEventFlags::CGEventFlagCommand);
-    key_up.set_flags(CGEventFlags::CGEventFlagCommand);
+/// Show the floating recording overlay window
+#[tauri::command]
+async fn show_overlay(app_handle: AppHandle) -> Result<(), String> {
+    // Check if overlay window already exists
+    if let Some(window) = app_handle.get_webview_window("overlay") {
+        window.show().map_err(|e| format!("Failed to show overlay: {}", e))?;
+        return Ok(());
+    }
 
-    // Post the events
-    key_down.post(CGEventTapLocation::HID);
+    // Get primary monitor for positioning
+    let monitor = app_handle
+        .primary_monitor()
+        .map_err(|e| format!("Failed to get monitor: {}", e))?
+        .ok_or("No primary monitor found")?;
 
-    // Small delay between key down and up
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    let monitor_width = monitor.size().width as f64 / monitor.scale_factor();
+    let x = (monitor_width - 340.0) / 2.0;
 
-    key_up.post(CGEventTapLocation::HID);
+    // Create new overlay window
+    let _overlay = WebviewWindowBuilder::new(&app_handle, "overlay", WebviewUrl::App("index.html".into()))
+        .title("Recording")
+        .inner_size(340.0, 72.0)
+        .position(x, 24.0)
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .always_on_top(true)
+        .focused(false)
+        .resizable(false)
+        .skip_taskbar(true)
+        .visible(true)
+        .build()
+        .map_err(|e| format!("Failed to create overlay window: {}", e))?;
 
+    Ok(())
+}
+
+/// Hide the floating recording overlay window
+#[tauri::command]
+async fn hide_overlay(app_handle: AppHandle) -> Result<(), String> {
+    if let Some(window) = app_handle.get_webview_window("overlay") {
+        window.close().map_err(|e| format!("Failed to close overlay: {}", e))?;
+    }
     Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    env_logger::init();
+    // Log to file so we can debug without Terminal (which steals mic permission)
+    let log_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".whisper-translate")
+        .join("app.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path);
+
+    let mut builder = env_logger::Builder::from_default_env();
+    builder.filter_level(log::LevelFilter::Info);
+    if let Ok(file) = log_file {
+        builder.target(env_logger::Target::Pipe(Box::new(file)));
+    }
+    builder.init();
+    log::info!("Log file: {}", log_path.display());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_macos_permissions::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             // Audio commands
@@ -354,6 +523,10 @@ pub fn run() {
             save_settings,
             // Clipboard commands
             copy_and_paste,
+            save_frontmost_app,
+            // Overlay commands
+            show_overlay,
+            hide_overlay,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

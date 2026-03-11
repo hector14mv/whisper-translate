@@ -1,7 +1,7 @@
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 
-use super::{build_translation_prompt, TranslationResult};
+use super::{get_language_name, TranslationResult};
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -10,7 +10,23 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 struct AnthropicRequest {
     model: String,
     max_tokens: u32,
+    system: Vec<SystemBlock>,
     messages: Vec<Message>,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemBlock {
+    #[serde(rename = "type")]
+    block_type: String,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+#[derive(Debug, Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    cache_type: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -31,7 +47,7 @@ struct ContentBlock {
     text: Option<String>,
 }
 
-/// Translate text using Claude API
+/// Translate text using Claude API with prompt caching
 pub async fn translate(
     text: &str,
     source_language: &str,
@@ -43,14 +59,34 @@ pub async fn translate(
         return Err("Anthropic API key not configured".to_string());
     }
 
-    let prompt = build_translation_prompt(text, source_language, target_language);
+    let source_lang_name = get_language_name(source_language);
+    let target_lang_name = get_language_name(target_language);
+
+    // System prompt (cacheable) - contains static translation instructions
+    // This gets cached for 5 minutes, reducing costs for repeated translations
+    let system_prompt = format!(
+        "You are a professional translator. Your task is to translate {} text to {}. \
+        Follow these rules strictly:\n\
+        1. Only respond with the translation, nothing else.\n\
+        2. Do not add any explanations, notes, or additional text.\n\
+        3. Maintain the original tone and meaning as closely as possible.\n\
+        4. Preserve any formatting like line breaks or punctuation.",
+        source_lang_name, target_lang_name
+    );
 
     let request = AnthropicRequest {
         model: model.to_string(),
         max_tokens: 4096,
+        system: vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: system_prompt,
+            cache_control: Some(CacheControl {
+                cache_type: "ephemeral".to_string(),
+            }),
+        }],
         messages: vec![Message {
             role: "user".to_string(),
-            content: prompt,
+            content: text.to_string(),
         }],
     };
 
@@ -63,6 +99,11 @@ pub async fn translate(
     headers.insert(
         "anthropic-version",
         HeaderValue::from_static(ANTHROPIC_VERSION),
+    );
+    // Enable prompt caching beta feature
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_static("prompt-caching-2024-07-31"),
     );
 
     let client = reqwest::Client::new();

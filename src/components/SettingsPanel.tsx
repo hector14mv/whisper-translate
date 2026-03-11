@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import {
   saveApiKey,
   getApiKey,
@@ -12,7 +13,7 @@ import {
   type ApiKeyType,
 } from '../lib/tauri';
 import type { WhisperModelInfo, AppSettings, TranslationProvider, OllamaStatus, ProviderInfo } from '../types';
-import { PROVIDER_DISPLAY_INFO, estimateCostPerMinute, getCostBreakdown, GLOBAL_HOTKEY_OPTIONS } from '../types';
+import { PROVIDER_DISPLAY_INFO, estimateCostPerMinute, GLOBAL_HOTKEY_OPTIONS } from '../types';
 
 interface SettingsPanelProps {
   isOpen: boolean;
@@ -23,96 +24,11 @@ interface SettingsPanelProps {
 
 const PROVIDERS: TranslationProvider[] = ['ollama', 'openai', 'anthropic', 'google'];
 
-// Cost Info Tooltip Component
-function CostInfoTooltip({ provider }: { provider: TranslationProvider }) {
-  const [isVisible, setIsVisible] = useState(false);
-  const breakdown = getCostBreakdown(provider);
-
-  if (provider === 'ollama') return null;
-
-  return (
-    <div className="relative inline-block">
-      <button
-        type="button"
-        className="ml-1.5 text-smoke hover:text-mist transition-colors"
-        onMouseEnter={() => setIsVisible(true)}
-        onMouseLeave={() => setIsVisible(false)}
-        onClick={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          setIsVisible(!isVisible);
-        }}
-      >
-        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-        </svg>
-      </button>
-
-      {isVisible && (
-        <div className="absolute z-50 bottom-full left-1/2 -translate-x-1/2 mb-2 w-64 p-4 glass-panel text-xs">
-          <div className="font-semibold text-cloud mb-3">Cost Calculation</div>
-
-          <div className="space-y-2 text-mist">
-            <div className="flex justify-between">
-              <span>Speech rate:</span>
-              <span className="text-cloud">{breakdown.wordsPerMinute} words/min</span>
-            </div>
-            <div className="flex justify-between">
-              <span>Tokens per word:</span>
-              <span className="text-cloud">~{breakdown.tokensPerWord}</span>
-            </div>
-            <div className="flex justify-between">
-              <span>Speech tokens:</span>
-              <span className="text-cloud">{breakdown.speechTokensPerMinute}/min</span>
-            </div>
-            <div className="flex justify-between">
-              <span>Prompt overhead:</span>
-              <span className="text-cloud">+{breakdown.promptOverheadTokens} tokens</span>
-            </div>
-
-            <div className="border-t border-glass-border my-2" />
-
-            <div className="flex justify-between">
-              <span>Input tokens:</span>
-              <span className="text-cloud">{breakdown.totalInputTokens}</span>
-            </div>
-            <div className="flex justify-between">
-              <span>Output tokens:</span>
-              <span className="text-cloud">{breakdown.totalOutputTokens}</span>
-            </div>
-
-            <div className="border-t border-glass-border my-2" />
-
-            <div className="flex justify-between text-[10px]">
-              <span>Input price:</span>
-              <span className="text-cloud">${breakdown.inputPricePerMillion}/M</span>
-            </div>
-            <div className="flex justify-between text-[10px]">
-              <span>Output price:</span>
-              <span className="text-cloud">${breakdown.outputPricePerMillion}/M</span>
-            </div>
-
-            <div className="border-t border-glass-border my-2" />
-
-            <div className="flex justify-between font-medium">
-              <span>Total:</span>
-              <span className="text-prism-green">${breakdown.totalCost.toFixed(6)}/min</span>
-            </div>
-
-            {breakdown.hasCaching && breakdown.cachedCost && (
-              <div className="flex justify-between text-[10px] text-prism-cyan">
-                <span>With caching:</span>
-                <span>${breakdown.cachedCost.toFixed(6)}/min</span>
-              </div>
-            )}
-          </div>
-
-          {/* Arrow */}
-          <div className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-obsidian" />
-        </div>
-      )}
-    </div>
-  );
+interface DownloadProgress {
+  model: string;
+  downloaded: number;
+  total: number;
+  percent: number;
 }
 
 export function SettingsPanel({
@@ -122,26 +38,29 @@ export function SettingsPanel({
   onSettingsChange,
 }: SettingsPanelProps) {
   const [apiKeys, setApiKeys] = useState<Record<ApiKeyType, string>>({
-    anthropic: '',
-    openai: '',
-    google: '',
+    anthropic: '', openai: '', google: '',
   });
   const [hasApiKey, setHasApiKey] = useState<Record<ApiKeyType, boolean>>({
-    anthropic: false,
-    openai: false,
-    google: false,
+    anthropic: false, openai: false, google: false,
   });
   const [isValidating, setIsValidating] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [models, setModels] = useState<WhisperModelInfo[]>([]);
   const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
   const [providerInfo, setProviderInfo] = useState<ProviderInfo | null>(null);
   const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(null);
 
+  // Listen for download progress events
   useEffect(() => {
-    if (isOpen) {
-      loadSettings();
-    }
+    const unlisten = listen<DownloadProgress>('download-progress', (event) => {
+      setDownloadProgress(event.payload);
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
+  useEffect(() => {
+    if (isOpen) loadSettings();
   }, [isOpen, settings.translation_provider]);
 
   const loadSettings = async () => {
@@ -157,9 +76,9 @@ export function SettingsPanel({
       });
 
       setApiKeys({
-        anthropic: anthropicKey ? '••••••••••••••••' + anthropicKey.slice(-4) : '',
-        openai: openaiKey ? '••••••••••••••••' + openaiKey.slice(-4) : '',
-        google: googleKey ? '••••••••••••••••' + googleKey.slice(-4) : '',
+        anthropic: anthropicKey ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022' + anthropicKey.slice(-4) : '',
+        openai: openaiKey ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022' + openaiKey.slice(-4) : '',
+        google: googleKey ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022' + googleKey.slice(-4) : '',
       });
 
       const modelStatus = await getWhisperModelStatus();
@@ -186,7 +105,7 @@ export function SettingsPanel({
     if (!keyType) return;
 
     const apiKey = apiKeys[keyType];
-    if (!apiKey || apiKey.includes('•')) return;
+    if (!apiKey || apiKey.includes('\u2022')) return;
 
     setIsValidating(true);
     setValidationError(null);
@@ -194,15 +113,14 @@ export function SettingsPanel({
     try {
       const isValid = await validateApiKey(keyType, apiKey);
       if (!isValid) {
-        const formatHint = getKeyFormatHint(keyType);
-        setValidationError(`Invalid API key format. ${formatHint}`);
+        setValidationError(`Invalid API key format. ${getKeyFormatHint(keyType)}`);
         setIsValidating(false);
         return;
       }
 
       await saveApiKey(keyType, apiKey);
       setHasApiKey((prev) => ({ ...prev, [keyType]: true }));
-      setApiKeys((prev) => ({ ...prev, [keyType]: '••••••••••••••••' + apiKey.slice(-4) }));
+      setApiKeys((prev) => ({ ...prev, [keyType]: '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022' + apiKey.slice(-4) }));
     } catch (err) {
       setValidationError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -226,7 +144,6 @@ export function SettingsPanel({
   const handleApiKeyChange = (value: string) => {
     const keyType = getCurrentApiKeyType();
     if (!keyType) return;
-
     setApiKeys((prev) => ({ ...prev, [keyType]: value }));
     setValidationError(null);
   };
@@ -245,6 +162,7 @@ export function SettingsPanel({
 
   const handleDownloadModel = async (modelName: string) => {
     setDownloadingModel(modelName);
+    setDownloadProgress(null);
     try {
       await downloadWhisperModel(modelName);
       const modelStatus = await getWhisperModelStatus();
@@ -253,32 +171,23 @@ export function SettingsPanel({
       console.error('Failed to download model:', err);
     } finally {
       setDownloadingModel(null);
+      setDownloadProgress(null);
     }
-  };
-
-  const openExternalLink = (url: string) => {
-    window.open(url, '_blank');
   };
 
   const getKeyFormatHint = (keyType: ApiKeyType): string => {
     switch (keyType) {
-      case 'anthropic':
-        return 'Key should start with "sk-ant-"';
-      case 'openai':
-        return 'Key should start with "sk-"';
-      case 'google':
-        return 'Key should start with "AIza"';
+      case 'anthropic': return 'Key should start with "sk-ant-"';
+      case 'openai': return 'Key should start with "sk-"';
+      case 'google': return 'Key should start with "AIza"';
     }
   };
 
   const getKeyPlaceholder = (keyType: ApiKeyType): string => {
     switch (keyType) {
-      case 'anthropic':
-        return 'sk-ant-...';
-      case 'openai':
-        return 'sk-...';
-      case 'google':
-        return 'AIza...';
+      case 'anthropic': return 'sk-ant-...';
+      case 'openai': return 'sk-...';
+      case 'google': return 'AIza...';
     }
   };
 
@@ -292,23 +201,21 @@ export function SettingsPanel({
     <div className="modal-overlay fixed inset-0 flex items-center justify-center z-50">
       <div className="modal-content w-full max-w-md max-h-[90vh] overflow-y-auto m-4">
         {/* Header */}
-        <div className="flex items-center justify-between p-5 border-b border-glass-border">
-          <h2 className="text-lg font-semibold text-snow font-display">Settings</h2>
-          <button
-            onClick={onClose}
-            className="icon-btn w-8 h-8"
-          >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-border">
+          <h2 className="text-[15px] font-semibold text-text-primary">Settings</h2>
+          <button onClick={onClose} className="icon-btn">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M6 18L18 6M6 6l12 12" />
             </svg>
           </button>
         </div>
 
         <div className="p-5 space-y-6">
-          {/* Translation Provider Section */}
-          <section>
-            <h3 className="text-sm font-semibold text-cloud mb-3">Translation Provider</h3>
-            <div className="space-y-2">
+          {/* ======================== */}
+          {/* Translation Provider     */}
+          {/* ======================== */}
+          <Section title="Translation Provider">
+            <div className="space-y-1.5">
               {PROVIDERS.map((provider) => {
                 const info = PROVIDER_DISPLAY_INFO[provider];
                 const costPerMinute = estimateCostPerMinute(provider);
@@ -319,210 +226,152 @@ export function SettingsPanel({
                   <div
                     key={provider}
                     onClick={() => handleProviderChange(provider)}
-                    className={`provider-card ${isSelected ? 'selected' : ''} ${isOllama ? 'border-prism-green/30 hover:border-prism-green/50' : ''}`}
+                    className={`card-interactive px-3 py-2.5 ${isSelected ? 'selected' : ''}`}
                   >
                     <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className={`w-2 h-2 rounded-full ${isSelected ? (isOllama ? 'bg-prism-green' : 'bg-prism-violet') : 'bg-smoke'}`} />
+                      <div className="flex items-center gap-2.5">
+                        <div className={`w-1.5 h-1.5 rounded-full ${isSelected ? 'bg-accent' : 'bg-text-ghost'}`} />
                         <div>
                           <div className="flex items-center gap-2">
-                            <p className="font-medium text-cloud">{info.name}</p>
-                            {isOllama && (
-                              <span className="px-1.5 py-0.5 text-[10px] font-bold bg-prism-green/20 text-prism-green rounded">
-                                FREE
-                              </span>
-                            )}
+                            <span className="text-[13px] font-medium text-text-primary">{info.name}</span>
+                            {isOllama && <span className="badge badge-green">FREE</span>}
                           </div>
-                          <p className="text-xs text-smoke">{info.description}</p>
+                          <span className="text-[11px] text-text-tertiary">{info.description}</span>
                         </div>
                       </div>
-                      <span className={`text-xs font-medium flex items-center ${isOllama ? 'text-prism-green' : 'text-mist'}`}>
-                        {isOllama
-                          ? '$0.00/min'
-                          : `~$${costPerMinute.toFixed(4)}/min`}
-                        <CostInfoTooltip provider={provider} />
+                      <span className="text-[11px] font-medium text-text-tertiary">
+                        {isOllama ? '$0/min' : `~$${costPerMinute.toFixed(4)}/min`}
                       </span>
                     </div>
                   </div>
                 );
               })}
             </div>
-            <p className="text-[10px] text-smoke mt-3">
-              Based on ~150 words/min + prompt overhead
-            </p>
-          </section>
+          </Section>
 
-          {/* API Key Section */}
+          {/* ======================== */}
+          {/* API Key                  */}
+          {/* ======================== */}
           {currentKeyType && providerInfo && (
-            <section>
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="text-sm font-semibold text-cloud">
-                  {PROVIDER_DISPLAY_INFO[settings.translation_provider].name} API Key
-                </h3>
+            <Section
+              title={`${PROVIDER_DISPLAY_INFO[settings.translation_provider].name} API Key`}
+              action={
                 <button
-                  onClick={() => openExternalLink(providerInfo.api_key_url)}
-                  className="text-xs text-prism-violet hover:text-prism-pink transition-colors font-medium"
+                  onClick={() => window.open(providerInfo.api_key_url, '_blank')}
+                  className="text-[11px] text-accent hover:text-accent-hover transition-colors font-medium"
                 >
-                  Get API Key →
+                  Get key
                 </button>
-              </div>
-              <div className="space-y-3">
-                <div className="flex gap-2">
-                  <input
-                    type={currentApiKey.includes('•') ? 'text' : 'password'}
-                    value={currentApiKey}
-                    onChange={(e) => handleApiKeyChange(e.target.value)}
-                    placeholder={getKeyPlaceholder(currentKeyType)}
-                    className="input-field flex-1"
-                  />
-                  {currentHasKey ? (
-                    <button
-                      onClick={handleDeleteApiKey}
-                      className="btn-secondary text-prism-red"
-                    >
-                      Remove
-                    </button>
-                  ) : (
-                    <button
-                      onClick={handleSaveApiKey}
-                      disabled={isValidating || !currentApiKey}
-                      className="btn-primary disabled:opacity-50"
-                    >
-                      {isValidating ? 'Saving...' : 'Save'}
-                    </button>
-                  )}
-                </div>
-                {validationError && (
-                  <p className="text-sm text-prism-red">{validationError}</p>
+              }
+            >
+              <div className="flex gap-2">
+                <input
+                  type={currentApiKey.includes('\u2022') ? 'text' : 'password'}
+                  value={currentApiKey}
+                  onChange={(e) => handleApiKeyChange(e.target.value)}
+                  placeholder={getKeyPlaceholder(currentKeyType)}
+                  className="input-field flex-1"
+                />
+                {currentHasKey ? (
+                  <button onClick={handleDeleteApiKey} className="btn-secondary text-red text-[13px]">
+                    Remove
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleSaveApiKey}
+                    disabled={isValidating || !currentApiKey}
+                    className="btn-primary text-[13px]"
+                  >
+                    {isValidating ? 'Saving...' : 'Save'}
+                  </button>
                 )}
-                <p className="text-xs text-smoke">
-                  Stored securely in macOS Keychain
-                </p>
               </div>
-            </section>
+              {validationError && (
+                <p className="text-[12px] text-red mt-2">{validationError}</p>
+              )}
+              <p className="text-[11px] text-text-ghost mt-2">Stored in macOS Keychain</p>
+            </Section>
           )}
 
-          {/* Ollama Status Section */}
+          {/* ======================== */}
+          {/* Ollama Status            */}
+          {/* ======================== */}
           {settings.translation_provider === 'ollama' && (
-            <section>
-              <h3 className="text-sm font-semibold text-cloud mb-3">Ollama Status</h3>
+            <Section title="Ollama Status">
               {ollamaStatus ? (
                 ollamaStatus.is_running ? (
-                  <div className="space-y-4">
-                    <div className="flex items-center gap-2 text-prism-green">
-                      <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                        <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
-                      </svg>
-                      <span className="text-sm font-medium">Ollama is running</span>
-                    </div>
-
-                    {/* Recommended Models Section */}
-                    <div className="glass-panel-sm p-3 space-y-2">
-                      <p className="text-xs font-semibold text-cloud mb-2">Recommended for Translation</p>
-                      {[
-                        { id: 'qwen2.5', name: 'Qwen 2.5', badge: 'BEST', desc: 'Excellent multilingual support', badgeColor: 'bg-prism-green/20 text-prism-green' },
-                        { id: 'llama3.2', name: 'Llama 3.2', badge: null, desc: 'Fast, good for European languages', badgeColor: '' },
-                        { id: 'mistral', name: 'Mistral', badge: null, desc: 'Balanced quality and speed', badgeColor: '' },
-                      ].map((model) => {
-                        const isInstalled = ollamaStatus.models.some(m => m.startsWith(model.id));
-                        return (
-                          <div key={model.id} className="flex items-center justify-between py-1">
-                            <div className="flex items-center gap-2">
-                              <span className="text-xs text-mist">{model.name}</span>
-                              {model.badge && (
-                                <span className={`px-1.5 py-0.5 text-[9px] font-bold ${model.badgeColor} rounded`}>
-                                  {model.badge}
-                                </span>
-                              )}
-                            </div>
-                            <div className="flex items-center gap-2">
-                              <span className="text-[10px] text-smoke">{model.desc}</span>
-                              {isInstalled ? (
-                                <span className="text-[10px] text-prism-green font-medium">Installed</span>
-                              ) : (
-                                <span className="text-[10px] text-smoke">ollama pull {model.id}</span>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })}
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-green">
+                      <div className="w-1.5 h-1.5 rounded-full bg-green" />
+                      <span className="text-[13px] font-medium">Running</span>
                     </div>
 
                     {ollamaStatus.models.length > 0 ? (
-                      <div>
-                        <p className="text-xs text-smoke mb-2">Your models:</p>
-                        <div className="flex flex-wrap gap-1">
-                          {ollamaStatus.models.map((model) => (
-                            <span
-                              key={model}
-                              className="px-2 py-1 glass-panel-sm text-xs text-mist"
-                            >
-                              {model}
-                            </span>
-                          ))}
-                        </div>
+                      <div className="flex flex-wrap gap-1">
+                        {ollamaStatus.models.map((model) => (
+                          <span key={model} className="badge badge-accent">{model}</span>
+                        ))}
                       </div>
                     ) : (
-                      <p className="text-xs text-prism-yellow">
-                        No models installed. Run `ollama pull qwen2.5` to get started with the best translation model.
+                      <p className="text-[12px] text-yellow">
+                        No models. Run <code className="bg-surface-2 px-1 py-0.5 rounded text-text-secondary">ollama pull qwen2.5</code>
                       </p>
                     )}
                   </div>
                 ) : (
                   <div className="space-y-2">
-                    <div className="flex items-center gap-2 text-prism-red">
-                      <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                        <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
-                      </svg>
-                      <span className="text-sm font-medium">Ollama is not running</span>
+                    <div className="flex items-center gap-2 text-red">
+                      <div className="w-1.5 h-1.5 rounded-full bg-red" />
+                      <span className="text-[13px] font-medium">Not running</span>
                     </div>
-                    <p className="text-xs text-smoke">
-                      Run `ollama serve` in your terminal
+                    <p className="text-[12px] text-text-tertiary">
+                      Run <code className="bg-surface-2 px-1 py-0.5 rounded text-text-secondary">ollama serve</code> in your terminal
                     </p>
-                    <button
-                      onClick={() => openExternalLink('https://ollama.com/download')}
-                      className="text-xs text-prism-violet hover:text-prism-pink font-medium transition-colors"
-                    >
-                      Download Ollama →
-                    </button>
                   </div>
                 )
               ) : (
-                <p className="text-sm text-smoke">Checking status...</p>
+                <p className="text-[13px] text-text-tertiary">Checking...</p>
               )}
-            </section>
+            </Section>
           )}
 
-          {/* Whisper Model Section */}
-          <section>
-            <h3 className="text-sm font-semibold text-cloud mb-3">Whisper Model</h3>
-            <div className="space-y-2">
+          {/* ======================== */}
+          {/* Whisper Model            */}
+          {/* ======================== */}
+          <Section title="Whisper Model">
+            <div className="space-y-1.5">
               {models.map((model) => {
                 const isSelected = settings.whisper_model === model.name;
+                const isDownloading = downloadingModel === model.name;
+                const progress = isDownloading && downloadProgress?.model === model.name ? downloadProgress : null;
+
                 return (
                   <div
                     key={model.name}
                     onClick={() => model.downloaded && onSettingsChange({ ...settings, whisper_model: model.name as AppSettings['whisper_model'] })}
-                    className={`provider-card ${isSelected ? 'selected' : ''} ${!model.downloaded ? 'opacity-60' : ''}`}
+                    className={`card-interactive px-3 py-2.5 ${isSelected && model.downloaded ? 'selected' : ''} ${!model.downloaded && !isDownloading ? 'opacity-60' : ''}`}
                   >
                     <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className={`w-2 h-2 rounded-full ${isSelected && model.downloaded ? 'bg-prism-violet' : 'bg-smoke'}`} />
+                      <div className="flex items-center gap-2.5">
+                        <div className={`w-1.5 h-1.5 rounded-full ${isSelected && model.downloaded ? 'bg-accent' : 'bg-text-ghost'}`} />
                         <div>
-                          <p className="font-medium text-cloud capitalize">{model.name}</p>
-                          <p className="text-xs text-smoke">
+                          <span className="text-[13px] font-medium text-text-primary capitalize">{model.name}</span>
+                          <div className="text-[11px] text-text-tertiary">
                             {model.size_mb >= 1000
                               ? `${(model.size_mb / 1000).toFixed(1)} GB`
                               : `${model.size_mb} MB`}
-                            {' · '}
-                            {model.name === 'small' && 'Good · Fast'}
-                            {model.name === 'medium' && 'Better · Medium'}
-                            {model.name === 'large' && 'Best · Slower'}
-                          </p>
+                            {' \u00b7 '}
+                            {model.name === 'large-v3-turbo' && 'Fast & accurate \u00b7 Recommended'}
+                            {model.name === 'large-v3' && 'Highest accuracy \u00b7 Slower'}
+                          </div>
                         </div>
                       </div>
                       {model.downloaded ? (
-                        <span className="text-xs text-prism-green font-medium">Ready</span>
+                        <span className="badge badge-green">Ready</span>
+                      ) : isDownloading ? (
+                        <span className="text-[11px] text-accent font-medium tabular-nums">
+                          {progress ? `${Math.round(progress.percent)}%` : 'Starting...'}
+                        </span>
                       ) : (
                         <button
                           onClick={(e) => {
@@ -530,81 +379,86 @@ export function SettingsPanel({
                             handleDownloadModel(model.name);
                           }}
                           disabled={downloadingModel !== null}
-                          className="text-xs btn-primary py-1.5 px-3"
+                          className="btn-primary text-[12px] py-1.5 px-3"
                         >
-                          {downloadingModel === model.name ? 'Loading...' : 'Download'}
+                          Download
                         </button>
                       )}
                     </div>
+                    {/* Progress bar during download */}
+                    {isDownloading && progress && (
+                      <div className="mt-2.5 ml-4">
+                        <div className="progress-bar">
+                          <div className="progress-bar-fill" style={{ width: `${progress.percent}%` }} />
+                        </div>
+                        <div className="flex justify-between mt-1">
+                          <span className="text-[10px] text-text-ghost">
+                            {(progress.downloaded / 1024 / 1024).toFixed(0)} / {(progress.total / 1024 / 1024).toFixed(0)} MB
+                          </span>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 );
               })}
             </div>
-          </section>
+          </Section>
 
-          {/* Recording Mode Section */}
-          <section>
-            <h3 className="text-sm font-semibold text-cloud mb-3">Recording Mode</h3>
-            <div className="space-y-2">
-              <div
-                onClick={() => onSettingsChange({ ...settings, recording_mode: 'click_to_record' })}
-                className={`provider-card ${settings.recording_mode === 'click_to_record' ? 'selected' : ''}`}
-              >
-                <div className="flex items-center gap-3">
-                  <div className={`w-2 h-2 rounded-full ${settings.recording_mode === 'click_to_record' ? 'bg-prism-violet' : 'bg-smoke'}`} />
-                  <div>
-                    <p className="font-medium text-cloud">Click to Record</p>
-                    <p className="text-xs text-smoke">Tap to start, tap again to stop</p>
+          {/* ======================== */}
+          {/* Recording Mode           */}
+          {/* ======================== */}
+          <Section title="Recording Mode">
+            <div className="space-y-1.5">
+              {([
+                { id: 'double_tap' as const, name: 'Double Tap', desc: 'Double-tap hotkey to start/stop', badge: 'RECOMMENDED' },
+                { id: 'click_to_record' as const, name: 'Click to Record', desc: 'Tap to start, tap again to stop', badge: null },
+                { id: 'push_to_talk' as const, name: 'Push to Talk', desc: 'Hold to record, release to stop', badge: null },
+              ]).map((mode) => (
+                <div
+                  key={mode.id}
+                  onClick={() => onSettingsChange({ ...settings, recording_mode: mode.id })}
+                  className={`card-interactive px-3 py-2.5 ${settings.recording_mode === mode.id ? 'selected' : ''}`}
+                >
+                  <div className="flex items-center gap-2.5">
+                    <div className={`w-1.5 h-1.5 rounded-full ${settings.recording_mode === mode.id ? 'bg-accent' : 'bg-text-ghost'}`} />
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[13px] font-medium text-text-primary">{mode.name}</span>
+                        {mode.badge && <span className="badge badge-accent">{mode.badge}</span>}
+                      </div>
+                      <span className="text-[11px] text-text-tertiary">{mode.desc}</span>
+                    </div>
                   </div>
                 </div>
-              </div>
-              <div
-                onClick={() => onSettingsChange({ ...settings, recording_mode: 'push_to_talk' })}
-                className={`provider-card ${settings.recording_mode === 'push_to_talk' ? 'selected' : ''}`}
-              >
-                <div className="flex items-center gap-3">
-                  <div className={`w-2 h-2 rounded-full ${settings.recording_mode === 'push_to_talk' ? 'bg-prism-violet' : 'bg-smoke'}`} />
-                  <div>
-                    <p className="font-medium text-cloud">Push to Talk</p>
-                    <p className="text-xs text-smoke">Hold to record, release to stop</p>
-                  </div>
-                </div>
-              </div>
+              ))}
             </div>
-          </section>
+          </Section>
 
-          {/* Translation Toggle Section */}
-          <section>
-            <div className="flex items-center justify-between p-4 glass-panel-sm">
-              <div>
-                <h3 className="text-sm font-semibold text-cloud">Enable Translation</h3>
-                <p className="text-xs text-smoke">When off, shows transcription only</p>
-              </div>
-              <div
-                onClick={() => onSettingsChange({ ...settings, translation_enabled: !settings.translation_enabled })}
-                className={`toggle-switch ${settings.translation_enabled ? 'active' : ''}`}
+          {/* ======================== */}
+          {/* Toggles                  */}
+          {/* ======================== */}
+          <Section title="Options">
+            <div className="space-y-0">
+              <ToggleRow
+                label="Enable Translation"
+                description="When off, transcription only"
+                checked={settings.translation_enabled}
+                onChange={() => onSettingsChange({ ...settings, translation_enabled: !settings.translation_enabled })}
+              />
+              <ToggleRow
+                label="Remove Filler Words"
+                description="Clean up um, uh, like, etc."
+                checked={settings.remove_filler_words}
+                onChange={() => onSettingsChange({ ...settings, remove_filler_words: !settings.remove_filler_words })}
               />
             </div>
-          </section>
+          </Section>
 
-          {/* Filler Word Removal Section */}
-          <section>
-            <div className="flex items-center justify-between p-4 glass-panel-sm">
-              <div>
-                <h3 className="text-sm font-semibold text-cloud">Remove Filler Words</h3>
-                <p className="text-xs text-smoke">Clean up um, uh, like, you know, etc.</p>
-              </div>
-              <div
-                onClick={() => onSettingsChange({ ...settings, remove_filler_words: !settings.remove_filler_words })}
-                className={`toggle-switch ${settings.remove_filler_words ? 'active' : ''}`}
-              />
-            </div>
-          </section>
-
-          {/* Target Language Section */}
+          {/* ======================== */}
+          {/* Target Language          */}
+          {/* ======================== */}
           {settings.translation_enabled && (
-            <section>
-              <h3 className="text-sm font-semibold text-cloud mb-3">Target Language</h3>
+            <Section title="Target Language">
               <select
                 value={settings.target_language}
                 onChange={(e) => onSettingsChange({ ...settings, target_language: e.target.value })}
@@ -630,64 +484,90 @@ export function SettingsPanel({
                 <option value="id">Indonesian</option>
                 <option value="uk">Ukrainian</option>
               </select>
-            </section>
+            </Section>
           )}
 
-          {/* Global Hotkey Section */}
-          <section>
-            <h3 className="text-sm font-semibold text-cloud mb-3">Global Hotkey</h3>
-            <div className="space-y-3">
-              <div className="flex items-center justify-between p-4 glass-panel-sm">
-                <div>
-                  <p className="font-medium text-cloud">Enable Global Hotkey</p>
-                  <p className="text-xs text-smoke">Record from anywhere with a keyboard shortcut</p>
-                </div>
-                <div
-                  onClick={() => onSettingsChange({ ...settings, global_hotkey_enabled: !settings.global_hotkey_enabled })}
-                  className={`toggle-switch ${settings.global_hotkey_enabled ? 'active' : ''}`}
-                />
-              </div>
+          {/* ======================== */}
+          {/* Global Hotkey            */}
+          {/* ======================== */}
+          <Section title="Global Hotkey">
+            <ToggleRow
+              label="Enable Global Hotkey"
+              description="Record from any app"
+              checked={settings.global_hotkey_enabled}
+              onChange={() => onSettingsChange({ ...settings, global_hotkey_enabled: !settings.global_hotkey_enabled })}
+            />
 
-              {settings.global_hotkey_enabled && (
-                <>
-                  <div className="space-y-2">
-                    {GLOBAL_HOTKEY_OPTIONS.map((option) => (
-                      <div
-                        key={option.id}
-                        onClick={() => onSettingsChange({ ...settings, global_hotkey: option.id })}
-                        className={`provider-card ${settings.global_hotkey === option.id ? 'selected' : ''}`}
-                      >
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-3">
-                            <div className={`w-2 h-2 rounded-full ${settings.global_hotkey === option.id ? 'bg-prism-violet' : 'bg-smoke'}`} />
-                            <div>
-                              <p className="font-medium text-cloud">{option.label}</p>
-                              <p className="text-xs text-smoke">{option.description}</p>
-                            </div>
-                          </div>
-                        </div>
+            {settings.global_hotkey_enabled && (
+              <div className="mt-3 space-y-1.5">
+                {GLOBAL_HOTKEY_OPTIONS.map((option) => (
+                  <div
+                    key={option.id}
+                    onClick={() => onSettingsChange({ ...settings, global_hotkey: option.id })}
+                    className={`card-interactive px-3 py-2.5 ${settings.global_hotkey === option.id ? 'selected' : ''}`}
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className={`w-1.5 h-1.5 rounded-full ${settings.global_hotkey === option.id ? 'bg-accent' : 'bg-text-ghost'}`} />
+                      <div>
+                        <span className="text-[13px] font-medium text-text-primary">{option.label}</span>
+                        <span className="text-[11px] text-text-tertiary ml-2">{option.description}</span>
                       </div>
-                    ))}
+                    </div>
                   </div>
-                  <p className="text-[10px] text-smoke">
-                    Hold the hotkey to record, release to stop. Works system-wide when app is running.
-                  </p>
-                  <p className="text-[10px] text-prism-yellow">
-                    Note: You may need to grant Accessibility permissions in System Settings → Privacy & Security → Accessibility.
-                  </p>
-                </>
-              )}
-            </div>
-          </section>
+                ))}
+                <p className="text-[11px] text-text-ghost mt-2">
+                  {settings.recording_mode === 'double_tap'
+                    ? 'Double-tap to start recording, double-tap again to stop. Result auto-pasted at cursor.'
+                    : 'Hold to record, release to stop. Works system-wide.'}
+                </p>
+                <p className="text-[11px] text-yellow">
+                  May need Accessibility permission in System Settings.
+                </p>
+              </div>
+            )}
+          </Section>
         </div>
 
         {/* Footer */}
-        <div className="p-5 border-t border-glass-border">
+        <div className="px-5 py-4 border-t border-border">
           <button onClick={onClose} className="btn-primary w-full">
             Done
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// Helper components
+function Section({ title, action, children }: { title: string; action?: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <section>
+      <div className="flex items-center justify-between mb-2.5">
+        <h3 className="text-[12px] font-medium text-text-tertiary uppercase tracking-wider">{title}</h3>
+        {action}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function ToggleRow({ label, description, checked, onChange }: {
+  label: string;
+  description: string;
+  checked: boolean;
+  onChange: () => void;
+}) {
+  return (
+    <div className="flex items-center justify-between py-2.5">
+      <div>
+        <p className="text-[13px] font-medium text-text-primary">{label}</p>
+        <p className="text-[11px] text-text-tertiary">{description}</p>
+      </div>
+      <div
+        onClick={onChange}
+        className={`toggle-switch ${checked ? 'active' : ''}`}
+      />
     </div>
   );
 }

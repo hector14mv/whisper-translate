@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-opener = "2"
 tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
@@ -33,7 +33,7 @@ cpal = "0.15"
 hound = "3.5"
 
 # Whisper for local transcription
-whisper-rs = "0.13"
+whisper-rs = { version = "0.15", features = ["metal"] }
 
 # Error handling
 thiserror = "1.0"
@@ -63,6 +63,12 @@ dirs = "5.0"
 
 # Clipboard access
 arboard = "3"
+
+# macOS permissions (accessibility check/request)
+tauri-plugin-macos-permissions = "2"
+
+# Cross-platform input simulation (paste via Cmd+V)
+enigo = "0.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"

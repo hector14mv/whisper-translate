@@ -4,28 +4,56 @@ import { register, unregister, isRegistered } from '@tauri-apps/plugin-global-sh
 interface UseGlobalHotkeyProps {
   enabled: boolean;
   hotkey: string;
-  onPressed: () => void;
-  onReleased: () => void;
+  mode: 'push_to_talk' | 'double_tap';
+  doubleTapInterval?: number;
+  onPressed?: () => void;
+  onReleased?: () => void;
+  onToggleRecording?: () => void;
 }
 
 export function useGlobalHotkey({
   enabled,
   hotkey,
+  mode,
+  doubleTapInterval = 400,
   onPressed,
   onReleased,
+  onToggleRecording,
 }: UseGlobalHotkeyProps) {
   const currentHotkeyRef = useRef<string | null>(null);
   const isKeyDownRef = useRef(false);
+  const lastPressTimeRef = useRef(0);
+  const doubleTapFiredRef = useRef(false);
 
   const handleShortcut = useCallback((event: { state: 'Pressed' | 'Released' }) => {
-    if (event.state === 'Pressed' && !isKeyDownRef.current) {
-      isKeyDownRef.current = true;
-      onPressed();
-    } else if (event.state === 'Released' && isKeyDownRef.current) {
-      isKeyDownRef.current = false;
-      onReleased();
+    if (mode === 'push_to_talk') {
+      // Push-to-talk: press=start, release=stop
+      if (event.state === 'Pressed' && !isKeyDownRef.current) {
+        isKeyDownRef.current = true;
+        onPressed?.();
+      } else if (event.state === 'Released' && isKeyDownRef.current) {
+        isKeyDownRef.current = false;
+        onReleased?.();
+      }
+    } else if (mode === 'double_tap') {
+      // Double-tap: two Pressed events within threshold toggles recording
+      if (event.state === 'Pressed') {
+        const now = Date.now();
+        const timeSinceLast = now - lastPressTimeRef.current;
+
+        if (timeSinceLast <= doubleTapInterval && !doubleTapFiredRef.current) {
+          // Double-tap detected
+          doubleTapFiredRef.current = true;
+          onToggleRecording?.();
+        } else {
+          // First tap or reset after double-tap
+          doubleTapFiredRef.current = false;
+        }
+
+        lastPressTimeRef.current = now;
+      }
     }
-  }, [onPressed, onReleased]);
+  }, [mode, doubleTapInterval, onPressed, onReleased, onToggleRecording]);
 
   useEffect(() => {
     const setupHotkey = async () => {

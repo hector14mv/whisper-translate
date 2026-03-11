@@ -21,7 +21,7 @@ impl ApiKeyType {
 }
 
 /// Save an API key to the macOS Keychain
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub fn save_api_key(key_type: String, api_key: String) -> Result<(), String> {
     let key_type = match key_type.as_str() {
         "anthropic" => ApiKeyType::Anthropic,
@@ -38,7 +38,7 @@ pub fn save_api_key(key_type: String, api_key: String) -> Result<(), String> {
 }
 
 /// Retrieve an API key from the macOS Keychain
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub fn get_api_key(key_type: String) -> Result<Option<String>, String> {
     let key_type = match key_type.as_str() {
         "anthropic" => ApiKeyType::Anthropic,
@@ -65,7 +65,7 @@ pub fn get_api_key(key_type: String) -> Result<Option<String>, String> {
 }
 
 /// Delete an API key from the macOS Keychain
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub fn delete_api_key(key_type: String) -> Result<(), String> {
     let key_type = match key_type.as_str() {
         "anthropic" => ApiKeyType::Anthropic,
@@ -91,7 +91,7 @@ pub fn delete_api_key(key_type: String) -> Result<(), String> {
 }
 
 /// Validate an API key format (basic validation, not actual API call)
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub fn validate_api_key(key_type: String, api_key: String) -> Result<bool, String> {
     match key_type.as_str() {
         "anthropic" => {

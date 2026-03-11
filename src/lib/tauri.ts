@@ -1,4 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
+import {
+  checkAccessibilityPermission as checkAccessibility,
+  requestAccessibilityPermission as requestAccessibility,
+} from 'tauri-plugin-macos-permissions-api';
 import type {
   AudioDeviceInfo,
   WhisperModelInfo,
@@ -121,4 +125,27 @@ export function getApiKeyTypeForProvider(provider: TranslationProvider): ApiKeyT
 // Clipboard commands
 export async function copyAndPaste(text: string): Promise<void> {
   return invoke('copy_and_paste', { text });
+}
+
+// Focus management
+export async function saveFrontmostApp(): Promise<void> {
+  return invoke('save_frontmost_app');
+}
+
+// Accessibility permission
+export async function checkAccessibilityPermission(): Promise<boolean> {
+  return checkAccessibility();
+}
+
+export async function requestAccessibilityPermission(): Promise<void> {
+  await requestAccessibility();
+}
+
+// Overlay commands
+export async function showOverlay(): Promise<void> {
+  return invoke('show_overlay');
+}
+
+export async function hideOverlay(): Promise<void> {
+  return invoke('hide_overlay');
 }

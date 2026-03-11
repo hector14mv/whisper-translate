@@ -1,25 +1,24 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { RecordButton } from './components/RecordButton';
+import { emit } from '@tauri-apps/api/event';
 import { TranscriptionView } from './components/TranscriptionView';
 import { SettingsPanel } from './components/SettingsPanel';
 import { HistoryList } from './components/HistoryList';
 import { useAudioRecorder } from './hooks/useAudioRecorder';
 import { useTranslation } from './hooks/useTranslation';
 import { useGlobalHotkey } from './hooks/useGlobalHotkey';
-import { getApiKey, getWhisperModelStatus, checkOllamaStatus, getApiKeyTypeForProvider, getSettings, saveSettings, copyAndPaste } from './lib/tauri';
+import { getApiKey, getWhisperModelStatus, checkOllamaStatus, getApiKeyTypeForProvider, getSettings, saveSettings, copyAndPaste, showOverlay, hideOverlay, saveFrontmostApp, checkAccessibilityPermission, requestAccessibilityPermission } from './lib/tauri';
 import type { TranslationEntry, AppSettings, TranscriptionResult, TranslationResult } from './types';
 import { PROVIDER_DISPLAY_INFO, GLOBAL_HOTKEY_OPTIONS } from './types';
 import './index.css';
 
-const MAX_HISTORY_ENTRIES = 10;
+const MAX_HISTORY_ENTRIES = 50;
 
 function App() {
   const [showSettings, setShowSettings] = useState(false);
-  const [showHistory, setShowHistory] = useState(false);
   const [history, setHistory] = useState<TranslationEntry[]>([]);
   const [settings, setSettings] = useState<AppSettings>({
-    recording_mode: 'click_to_record',
-    whisper_model: 'small',
+    recording_mode: 'double_tap',
+    whisper_model: 'large-v3-turbo',
     source_language: 'auto',
     target_language: 'en',
     translation_provider: 'openai',
@@ -27,10 +26,12 @@ function App() {
     translation_enabled: true,
     remove_filler_words: false,
     global_hotkey_enabled: false,
-    global_hotkey: 'CommandOrControl+Shift+Space',
+    global_hotkey: 'Alt+Space',
+    double_tap_interval: 400,
   });
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [setupNeeded, setSetupNeeded] = useState<string | null>(null);
+  const [accessibilityMissing, setAccessibilityMissing] = useState(false);
   const [selectedEntry, setSelectedEntry] = useState<{
     transcription: TranscriptionResult;
     translation: TranslationResult;
@@ -91,6 +92,24 @@ function App() {
       }
     };
   }, [settings, settingsLoaded]);
+
+  // Check accessibility permission on mount and when window regains focus
+  useEffect(() => {
+    const checkPermission = async () => {
+      try {
+        const granted = await checkAccessibilityPermission();
+        setAccessibilityMissing(!granted);
+      } catch {
+        // Not on macOS or plugin not available — ignore
+      }
+    };
+
+    checkPermission();
+
+    const onFocus = () => { checkPermission(); };
+    window.addEventListener('focus', onFocus);
+    return () => { window.removeEventListener('focus', onFocus); };
+  }, []);
 
   // Check setup on mount
   useEffect(() => {
@@ -153,6 +172,10 @@ function App() {
   }, [showSettings, settings.translation_provider, settings.translation_enabled]);
 
   const handleStopRecording = useCallback(async (fromHotkey = false) => {
+    if (fromHotkey) {
+      emit('recording-state-change', 'processing');
+    }
+
     const audioPath = await stopAudioRecording();
     if (audioPath) {
       const entry = await processAudio(
@@ -168,26 +191,53 @@ function App() {
         setHistory((prev) => [entry, ...prev].slice(0, MAX_HISTORY_ENTRIES));
         setSelectedEntry(null);
 
-        // Auto-paste if triggered by global hotkey
-        if (fromHotkey) {
-          const textToPaste = entry.translated_text || entry.original_text;
-          if (textToPaste) {
-            try {
-              await copyAndPaste(textToPaste);
-            } catch (err) {
-              console.error('Failed to auto-paste:', err);
-            }
+        // Always auto-paste result at cursor
+        const textToPaste = entry.translated_text || entry.original_text;
+        if (textToPaste) {
+          try {
+            await copyAndPaste(textToPaste);
+          } catch (err) {
+            console.error('Failed to auto-paste:', err);
           }
         }
+      }
+
+      if (fromHotkey) {
+        try {
+          await hideOverlay();
+        } catch (err) {
+          console.error('Failed to hide overlay:', err);
+        }
+      }
+    } else if (fromHotkey) {
+      try {
+        await hideOverlay();
+      } catch (err) {
+        console.error('Failed to hide overlay:', err);
       }
     }
   }, [stopAudioRecording, processAudio, settings.whisper_model, settings.target_language, settings.translation_provider, settings.translation_model, settings.translation_enabled, settings.remove_filler_words]);
 
-  // Global hotkey for system-wide recording (push-to-talk behavior)
+  const handleToggleRecording = useCallback(() => {
+    if (setupNeeded) return;
+
+    if (recordingState === 'idle') {
+      isHotkeyRecordingRef.current = true;
+      saveFrontmostApp().catch(() => {});
+      startRecording();
+      showOverlay().catch((err) => console.error('Failed to show overlay:', err));
+    } else if (recordingState === 'recording') {
+      const wasHotkeyRecording = isHotkeyRecordingRef.current;
+      isHotkeyRecordingRef.current = false;
+      handleStopRecording(wasHotkeyRecording);
+    }
+  }, [setupNeeded, recordingState, startRecording, handleStopRecording]);
+
   const handleGlobalHotkeyPressed = useCallback(() => {
     if (setupNeeded) return;
     if (recordingState === 'idle') {
       isHotkeyRecordingRef.current = true;
+      saveFrontmostApp().catch(() => {});
       startRecording();
     }
   }, [setupNeeded, recordingState, startRecording]);
@@ -200,11 +250,16 @@ function App() {
     }
   }, [recordingState, handleStopRecording]);
 
+  const isDoubleTapMode = settings.recording_mode === 'double_tap';
+
   useGlobalHotkey({
     enabled: settings.global_hotkey_enabled && !setupNeeded,
     hotkey: settings.global_hotkey,
+    mode: isDoubleTapMode ? 'double_tap' : 'push_to_talk',
+    doubleTapInterval: settings.double_tap_interval,
     onPressed: handleGlobalHotkeyPressed,
     onReleased: handleGlobalHotkeyReleased,
+    onToggleRecording: handleToggleRecording,
   });
 
   const handleSelectHistoryEntry = useCallback((entry: TranslationEntry) => {
@@ -219,7 +274,6 @@ function App() {
         target_language: entry.target_language,
       },
     });
-    setShowHistory(false);
   }, []);
 
   const handleClearHistory = useCallback(() => {
@@ -231,187 +285,220 @@ function App() {
     setSelectedEntry(null);
   }, [clearResults]);
 
+  const handleManualRecord = useCallback(() => {
+    if (setupNeeded) return;
+    if (recordingState === 'idle') {
+      saveFrontmostApp().catch(() => {});
+      startRecording();
+    } else if (recordingState === 'recording') {
+      handleStopRecording(false);
+    }
+  }, [setupNeeded, recordingState, startRecording, handleStopRecording]);
+
   const error = recordingError || translationError;
   const displayTranscription = selectedEntry?.transcription || transcription;
   const displayTranslation = selectedEntry?.translation || translation;
-  const currentState = isProcessing ? 'processing' : recordingState;
+  const hasResults = displayTranscription || displayTranslation;
+  const hotkeyLabel = GLOBAL_HOTKEY_OPTIONS.find(o => o.id === settings.global_hotkey)?.label || settings.global_hotkey;
 
   return (
-    <div className="min-h-screen bg-void flex relative overflow-hidden">
-      {/* Ambient background orbs */}
-      <div className="ambient-orb ambient-orb-1" />
-      <div className="ambient-orb ambient-orb-2" />
-      <div className="ambient-orb ambient-orb-3" />
-
-      {/* History Sidebar */}
+    <div className="h-screen flex flex-col bg-bg">
+      {/* Title bar drag region */}
       <div
-        className={`
-          fixed inset-y-0 left-0 w-72 sidebar transform transition-transform duration-300 z-40
-          ${showHistory ? 'translate-x-0' : '-translate-x-full'}
-        `}
+        className="h-12 flex items-center justify-between px-4 border-b border-border flex-shrink-0"
+        style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
       >
-        <HistoryList
-          entries={history}
-          onSelectEntry={handleSelectHistoryEntry}
-          onClearHistory={handleClearHistory}
-        />
-      </div>
+        <span className="text-[13px] font-medium text-text-secondary">
+          Whisper Translate
+        </span>
 
-      {/* Main Content */}
-      <div className="flex-1 flex flex-col min-h-screen relative z-10">
-        {/* Header */}
-        <header className="px-6 py-4 flex items-center justify-between">
+        <div className="flex items-center gap-1" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+          {/* Record button */}
           <button
-            onClick={() => setShowHistory(!showHistory)}
-            className="icon-btn"
-            title="History"
+            onClick={handleManualRecord}
+            disabled={!!setupNeeded || isProcessing}
+            className={`icon-btn ${recordingState === 'recording' ? 'active' : ''}`}
+            title={recordingState === 'recording' ? 'Stop recording' : 'Start recording'}
           >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={1.5}
-                d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
-              />
-            </svg>
+            {recordingState === 'recording' ? (
+              <div className="w-2.5 h-2.5 bg-red rounded-sm" />
+            ) : isProcessing ? (
+              <div className="spinner" />
+            ) : (
+              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
+                <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
+              </svg>
+            )}
           </button>
 
-          <h1 className="font-display text-xl font-semibold text-prismatic">
-            Whisper Translate
-          </h1>
-
+          {/* Settings button */}
           <button
             onClick={() => setShowSettings(true)}
             className="icon-btn"
             title="Settings"
           >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={1.5}
-                d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"
-              />
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={1.5}
-                d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"
-              />
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
             </svg>
           </button>
-        </header>
+        </div>
+      </div>
 
-        {/* Setup Warning */}
-        {setupNeeded && (
-          <div className="mx-6 mt-2 banner-warning">
-            <div className="flex items-center gap-3">
-              <svg className="w-5 h-5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
-                <path
-                  fillRule="evenodd"
-                  d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z"
-                  clipRule="evenodd"
-                />
-              </svg>
-              <div className="flex-1 flex items-center justify-between">
-                <p className="text-sm">{setupNeeded}</p>
-                <button
-                  onClick={() => setShowSettings(true)}
-                  className="text-sm font-medium hover:underline ml-4"
-                >
-                  Open Settings →
-                </button>
-              </div>
-            </div>
+      {/* Setup Warning */}
+      {setupNeeded && (
+        <div className="mx-4 mt-3 banner-warning">
+          <div className="flex items-center gap-2.5">
+            <svg className="w-4 h-4 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+              <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+            </svg>
+            <p className="flex-1 text-[13px]">{setupNeeded}</p>
+            <button
+              onClick={() => setShowSettings(true)}
+              className="text-[13px] font-medium hover:underline whitespace-nowrap"
+            >
+              Settings
+            </button>
           </div>
-        )}
+        </div>
+      )}
 
-        {/* Error Display */}
-        {error && (
-          <div className="mx-6 mt-2 banner-error">
-            <div className="flex items-center gap-3">
-              <svg className="w-5 h-5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
-                <path
-                  fillRule="evenodd"
-                  d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z"
-                  clipRule="evenodd"
-                />
-              </svg>
-              <p className="text-sm">{error}</p>
-            </div>
+      {/* Accessibility Permission Banner */}
+      {accessibilityMissing && (
+        <div className="mx-4 mt-3 banner-warning">
+          <div className="flex items-center gap-2.5">
+            <svg className="w-4 h-4 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+              <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+            </svg>
+            <p className="flex-1 text-[13px]">Enable Accessibility permission for auto-paste to work</p>
+            <button
+              onClick={async () => {
+                try {
+                  await requestAccessibilityPermission();
+                } catch {
+                  // ignore
+                }
+              }}
+              className="text-[13px] font-medium hover:underline whitespace-nowrap"
+            >
+              Open Settings
+            </button>
           </div>
-        )}
+        </div>
+      )}
 
-        {/* Main Content Area */}
-        <main className="flex-1 flex flex-col px-6 py-4">
-          {/* Transcription View */}
-          <div className="flex-1 mb-6 max-w-xl mx-auto w-full">
+      {/* Error Display */}
+      {error && (
+        <div className="mx-4 mt-3 banner-error">
+          <div className="flex items-center gap-2.5">
+            <svg className="w-4 h-4 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+            </svg>
+            <p className="text-[13px]">{error}</p>
+          </div>
+        </div>
+      )}
+
+      {/* Main Content */}
+      <main className="flex-1 overflow-y-auto">
+        {/* Latest result */}
+        {hasResults && (
+          <div className="p-4">
+            {selectedEntry && (
+              <button
+                onClick={handleNewRecording}
+                className="btn-ghost mb-3 text-[13px]"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                </svg>
+                Back to latest
+              </button>
+            )}
             <TranscriptionView
               transcription={displayTranscription}
               translation={displayTranslation}
               isProcessing={isProcessing}
             />
           </div>
+        )}
 
-          {/* New Recording Button (when showing history entry) */}
-          {selectedEntry && (
-            <button
-              onClick={handleNewRecording}
-              className="mb-4 text-sm text-prism-violet hover:text-prism-pink font-medium text-center transition-colors"
-            >
-              ← New Recording
-            </button>
-          )}
-
-          {/* Record Button */}
-          <div className="flex justify-center py-6">
-            <RecordButton
-              recordingState={currentState}
-              recordingMode={settings.recording_mode}
-              onStartRecording={startRecording}
-              onStopRecording={() => handleStopRecording(false)}
-              disabled={!!setupNeeded}
-            />
-          </div>
-        </main>
-
-        {/* Footer */}
-        <footer className="px-6 py-4">
-          <p className="text-xs text-smoke text-center">
-            {settings.translation_enabled ? (
+        {/* Empty state */}
+        {!hasResults && !setupNeeded && (
+          <div className="flex-1 flex flex-col items-center justify-center px-6 py-20">
+            <div className="w-12 h-12 rounded-full bg-surface-2 border border-border flex items-center justify-center mb-4">
+              <svg className="w-5 h-5 text-text-tertiary" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
+                <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
+              </svg>
+            </div>
+            {settings.global_hotkey_enabled && isDoubleTapMode ? (
               <>
-                Speak any language → Translated to{' '}
-                <span className="text-mist">{settings.target_language === 'en' ? 'English' : settings.target_language}</span>
-                {' · '}
-                <span className="text-mist">{PROVIDER_DISPLAY_INFO[settings.translation_provider].name}</span>
+                <p className="text-text-secondary text-[13px] font-medium mb-1">
+                  Double-tap <span className="kbd">{hotkeyLabel}</span> to start recording
+                </p>
+                <p className="text-[12px] text-text-tertiary">Text will be auto-pasted at your cursor</p>
+              </>
+            ) : settings.global_hotkey_enabled ? (
+              <>
+                <p className="text-text-secondary text-[13px] font-medium mb-1">
+                  Hold <span className="kbd">{hotkeyLabel}</span> to record
+                </p>
+                <p className="text-[12px] text-text-tertiary">Release to stop and auto-paste</p>
               </>
             ) : (
-              'Transcription mode · Translation disabled'
+              <>
+                <p className="text-text-secondary text-[13px] font-medium mb-1">Click the mic button to record</p>
+                <p className="text-[12px] text-text-tertiary">Or enable a global hotkey in settings</p>
+              </>
             )}
-          </p>
-          {settings.global_hotkey_enabled && (
-            <p className="text-[10px] text-smoke/70 text-center mt-1">
-              <span className="inline-flex items-center gap-1">
-                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
-                </svg>
-                Global hotkey:{' '}
-                <span className="text-prism-cyan font-medium">
-                  {GLOBAL_HOTKEY_OPTIONS.find(o => o.id === settings.global_hotkey)?.label || settings.global_hotkey}
-                </span>
-              </span>
-            </p>
-          )}
-        </footer>
-      </div>
+          </div>
+        )}
 
-      {/* History Overlay */}
-      {showHistory && (
-        <div
-          className="modal-overlay fixed inset-0 z-30"
-          onClick={() => setShowHistory(false)}
-        />
-      )}
+        {/* History */}
+        {history.length > 0 && (
+          <div className="px-4 pb-4">
+            {hasResults && <div className="divider mb-3" />}
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[12px] font-medium text-text-tertiary uppercase tracking-wider">History</span>
+              <button
+                onClick={handleClearHistory}
+                className="text-[12px] text-text-ghost hover:text-text-tertiary transition-colors"
+              >
+                Clear
+              </button>
+            </div>
+            <HistoryList
+              entries={history}
+              onSelectEntry={handleSelectHistoryEntry}
+              onClearHistory={handleClearHistory}
+            />
+          </div>
+        )}
+      </main>
+
+      {/* Footer status bar */}
+      <div className="px-4 py-2.5 border-t border-border flex-shrink-0">
+        <p className="text-[11px] text-text-ghost text-center">
+          {settings.translation_enabled ? (
+            <>
+              {PROVIDER_DISPLAY_INFO[settings.translation_provider].name}
+              {' · '}
+              {settings.target_language === 'en' ? 'English' : settings.target_language}
+            </>
+          ) : (
+            'Transcription only'
+          )}
+          {settings.global_hotkey_enabled && (
+            <>
+              {' · '}
+              {hotkeyLabel}
+              {isDoubleTapMode ? ' (double-tap)' : ' (hold)'}
+            </>
+          )}
+        </p>
+      </div>
 
       {/* Settings Panel */}
       <SettingsPanel
