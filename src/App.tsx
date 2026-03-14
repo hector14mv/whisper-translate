@@ -6,16 +6,32 @@ import { HistoryList } from './components/HistoryList';
 import { useAudioRecorder } from './hooks/useAudioRecorder';
 import { useTranslation } from './hooks/useTranslation';
 import { useGlobalHotkey } from './hooks/useGlobalHotkey';
-import { getApiKey, getWhisperModelStatus, checkOllamaStatus, getApiKeyTypeForProvider, getSettings, saveSettings, copyAndPaste, showOverlay, hideOverlay, saveFrontmostApp, checkAccessibilityPermission, requestAccessibilityPermission } from './lib/tauri';
+import { getApiKey, getWhisperModelStatus, checkOllamaStatus, getApiKeyTypeForProvider, getSettings, saveSettings, showOverlay, hideOverlay, saveFrontmostApp, checkAccessibilityPermission, requestAccessibilityPermission } from './lib/tauri';
 import type { TranslationEntry, AppSettings, TranscriptionResult, TranslationResult } from './types';
 import { PROVIDER_DISPLAY_INFO, GLOBAL_HOTKEY_OPTIONS } from './types';
 import './index.css';
 
 const MAX_HISTORY_ENTRIES = 50;
+const HISTORY_STORAGE_KEY = 'whisper-translate-history';
+
+function loadHistory(): TranslationEntry[] {
+  try {
+    const stored = localStorage.getItem(HISTORY_STORAGE_KEY);
+    return stored ? JSON.parse(stored) : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistHistory(entries: TranslationEntry[]) {
+  try {
+    localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(entries));
+  } catch { /* ignore storage errors */ }
+}
 
 function App() {
   const [showSettings, setShowSettings] = useState(false);
-  const [history, setHistory] = useState<TranslationEntry[]>([]);
+  const [history, setHistory] = useState<TranslationEntry[]>(loadHistory);
   const [settings, setSettings] = useState<AppSettings>({
     recording_mode: 'double_tap',
     whisper_model: 'large-v3-turbo',
@@ -194,7 +210,11 @@ function App() {
         settings.remove_filler_words
       );
       if (entry) {
-        setHistory((prev) => [entry, ...prev].slice(0, MAX_HISTORY_ENTRIES));
+        setHistory((prev) => {
+          const updated = [entry, ...prev].slice(0, MAX_HISTORY_ENTRIES);
+          persistHistory(updated);
+          return updated;
+        });
         setSelectedEntry(null);
 
         // Play completion sound — reuse a single AudioContext to avoid browser limit (~6 max)
@@ -215,13 +235,13 @@ function App() {
           osc.stop(ctx.currentTime + 0.25);
         } catch { /* ignore audio errors */ }
 
-        // Always auto-paste result at cursor
-        const textToPaste = entry.translated_text || entry.original_text;
-        if (textToPaste) {
+        // Copy result to clipboard
+        const textToCopy = entry.translated_text || entry.original_text;
+        if (textToCopy) {
           try {
-            await copyAndPaste(textToPaste);
+            await navigator.clipboard.writeText(textToCopy);
           } catch (err) {
-            console.error('Failed to auto-paste:', err);
+            console.error('Failed to copy to clipboard:', err);
           }
         }
       }
@@ -302,6 +322,7 @@ function App() {
 
   const handleClearHistory = useCallback(() => {
     setHistory([]);
+    persistHistory([]);
   }, []);
 
   const handleNewRecording = useCallback(() => {
