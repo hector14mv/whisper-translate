@@ -35,6 +35,7 @@ struct ResponseMessage {
 
 /// Translate text using OpenAI API
 pub async fn translate(
+    client: &reqwest::Client,
     text: &str,
     source_language: &str,
     target_language: &str,
@@ -64,7 +65,6 @@ pub async fn translate(
             .map_err(|_| "Invalid API key format")?,
     );
 
-    let client = reqwest::Client::new();
     let response = client
         .post(OPENAI_API_URL)
         .headers(headers)

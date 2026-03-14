@@ -56,6 +56,7 @@ struct GeminiError {
 
 /// Translate text using Google Gemini API
 pub async fn translate(
+    client: &reqwest::Client,
     text: &str,
     source_language: &str,
     target_language: &str,
@@ -68,7 +69,7 @@ pub async fn translate(
 
     let prompt = build_translation_prompt(text, source_language, target_language);
 
-    let url = format!("{}{}:generateContent?key={}", GEMINI_API_BASE, model, api_key);
+    let url = format!("{}/{}:generateContent?key={}", GEMINI_API_BASE, model, api_key);
 
     let request = GeminiRequest {
         contents: vec![Content {
@@ -82,7 +83,6 @@ pub async fn translate(
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-    let client = reqwest::Client::new();
     let response = client
         .post(&url)
         .headers(headers)

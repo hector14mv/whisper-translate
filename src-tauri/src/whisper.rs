@@ -3,8 +3,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, State};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
+use crate::AppState;
 
 /// Whisper model information
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +148,7 @@ pub async fn transcribe_audio(
     model_name: String,
     #[allow(unused_variables)]
     remove_filler_words: Option<bool>,
+    state: State<'_, AppState>,
 ) -> Result<TranscriptionResult, String> {
     let model_path = get_model_path(&model_name)?;
 
@@ -153,16 +156,38 @@ pub async fn transcribe_audio(
         return Err(format!("Model {} not downloaded", model_name));
     }
 
+    let model_path_str = model_path
+        .to_str()
+        .ok_or("Invalid model path: non-UTF-8 characters")?;
+
     let total_start = std::time::Instant::now();
 
-    // Load the Whisper model
+    // Load or reuse cached Whisper model context
     let t0 = std::time::Instant::now();
-    let ctx = WhisperContext::new_with_params(
-        model_path.to_str().unwrap(),
-        WhisperContextParameters::default(),
-    )
-    .map_err(|e| format!("Failed to load Whisper model: {}", e))?;
-    log::info!("[TIMING] Model load: {:?}", t0.elapsed());
+    let mut ctx_guard = state
+        .whisper_context
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // Check if there is a cached context for the same model; otherwise load from disk.
+    // We inspect the cached name before taking ownership to avoid unnecessary moves.
+    let is_cache_hit = matches!(ctx_guard.as_ref(), Some((name, _)) if name == &model_name);
+    let ctx = if is_cache_hit {
+        let (_, ctx) = ctx_guard.take().expect("cache hit but Option was None");
+        log::info!("[TIMING] Model cache hit ({}), skipping load", model_name);
+        ctx
+    } else {
+        // Drop stale entry (different model or first run) before loading
+        *ctx_guard = None;
+        log::info!("[TIMING] Model cache miss, loading from disk...");
+        WhisperContext::new_with_params(model_path_str, WhisperContextParameters::default())
+            .map_err(|e| format!("Failed to load Whisper model: {}", e))?
+    };
+
+    // Release the lock while doing transcription — this is the slow part
+    drop(ctx_guard);
+
+    log::info!("[TIMING] Model load/cache: {:?}", t0.elapsed());
 
     // Read the audio file
     let t0 = std::time::Instant::now();
@@ -181,21 +206,21 @@ pub async fn transcribe_audio(
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
 
-    // Create state and run inference
-    let mut state = ctx.create_state().map_err(|e| format!("Failed to create state: {}", e))?;
+    // Create whisper_state and run inference
+    let mut whisper_state = ctx.create_state().map_err(|e| format!("Failed to create state: {}", e))?;
 
     let t0 = std::time::Instant::now();
-    state
+    whisper_state
         .full(params, &audio_data)
         .map_err(|e| format!("Transcription failed: {}", e))?;
     log::info!("[TIMING] Whisper inference: {:?}", t0.elapsed());
 
     // Get the transcribed text
-    let num_segments = state.full_n_segments();
+    let num_segments = whisper_state.full_n_segments();
     let mut text = String::new();
 
     for i in 0..num_segments {
-        if let Some(segment) = state.get_segment(i) {
+        if let Some(segment) = whisper_state.get_segment(i) {
             let no_speech = segment.no_speech_probability();
             if let Ok(segment_text) = segment.to_str_lossy() {
                 log::info!("[WHISPER] Segment {}: no_speech={:.3}, text=\"{}\"", i, no_speech, segment_text.trim());
@@ -237,6 +262,14 @@ pub async fn transcribe_audio(
         text.len(),
         detected_language
     );
+
+    // Put the context back into the cache for next invocation
+    let mut ctx_guard = state
+        .whisper_context
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *ctx_guard = Some((model_name.to_string(), ctx));
+    drop(ctx_guard);
 
     Ok(TranscriptionResult {
         text,

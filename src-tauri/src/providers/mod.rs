@@ -134,6 +134,7 @@ pub struct ProviderConfig {
 
 /// Translate text using the specified provider
 pub async fn translate(
+    client: &reqwest::Client,
     config: &ProviderConfig,
     text: &str,
     source_language: &str,
@@ -154,28 +155,28 @@ pub async fn translate(
                 .api_key
                 .as_ref()
                 .ok_or("Anthropic API key not configured")?;
-            anthropic::translate(text, source_language, target_language, api_key, &model).await
+            anthropic::translate(client, text, source_language, target_language, api_key, &model).await
         }
         TranslationProvider::OpenAI => {
             let api_key = config
                 .api_key
                 .as_ref()
                 .ok_or("OpenAI API key not configured")?;
-            openai::translate(text, source_language, target_language, api_key, &model).await
+            openai::translate(client, text, source_language, target_language, api_key, &model).await
         }
         TranslationProvider::Google => {
             let api_key = config
                 .api_key
                 .as_ref()
                 .ok_or("Google API key not configured")?;
-            google::translate(text, source_language, target_language, api_key, &model).await
+            google::translate(client, text, source_language, target_language, api_key, &model).await
         }
         TranslationProvider::Ollama => {
             let base_url = config
                 .ollama_url
                 .as_deref()
                 .unwrap_or("http://localhost:11434");
-            ollama::translate(text, source_language, target_language, base_url, &model).await
+            ollama::translate(client, text, source_language, target_language, base_url, &model).await
         }
     }
 }

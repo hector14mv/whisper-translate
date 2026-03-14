@@ -79,6 +79,7 @@ pub async fn list_ollama_models() -> Result<Vec<OllamaModel>, String> {
 
 /// Translate text using Ollama (local LLM)
 pub async fn translate(
+    client: &reqwest::Client,
     text: &str,
     source_language: &str,
     target_language: &str,
@@ -98,15 +99,11 @@ pub async fn translate(
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120)) // Longer timeout for local models
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-
     let response = client
         .post(&url)
         .headers(headers)
         .json(&request)
+        .timeout(std::time::Duration::from_secs(120))
         .send()
         .await
         .map_err(|e| {

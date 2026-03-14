@@ -49,6 +49,7 @@ struct ContentBlock {
 
 /// Translate text using Claude API with prompt caching
 pub async fn translate(
+    client: &reqwest::Client,
     text: &str,
     source_language: &str,
     target_language: &str,
@@ -106,7 +107,6 @@ pub async fn translate(
         HeaderValue::from_static("prompt-caching-2024-07-31"),
     );
 
-    let client = reqwest::Client::new();
     let response = client
         .post(ANTHROPIC_API_URL)
         .headers(headers)

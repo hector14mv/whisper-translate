@@ -5,19 +5,28 @@ mod translate;
 mod whisper;
 
 use arboard::Clipboard;
+use audio::RecordingHandle;
 use providers::{ModelInfo, ProviderConfig, TranslationProvider};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use whisper_rs::WhisperContext;
 
 
 /// Application state shared across commands
 pub struct AppState {
-    pub is_recording: Mutex<bool>,
+    /// Active recording handle; presence signals that recording is in progress.
+    /// Using the handle itself as the source of truth eliminates the TOCTOU race
+    /// that existed when `is_recording: Mutex<bool>` was kept separately.
+    pub(crate) recording_handle: Mutex<Option<RecordingHandle>>,
     pub anthropic_api_key: Mutex<Option<String>>,
     pub whisper_model_path: Mutex<Option<String>>,
+    /// Shared HTTP client with connection pooling (avoids creating a new client per request)
+    pub http_client: reqwest::Client,
+    /// Cached Whisper context: (model_name, context) for cache invalidation on model change
+    pub whisper_context: Mutex<Option<(String, WhisperContext)>>,
     /// PID of the app that was frontmost when recording started
     #[cfg(target_os = "macos")]
     pub previous_app_pid: Mutex<Option<i32>>,
@@ -26,9 +35,11 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            is_recording: Mutex::new(false),
+            recording_handle: Mutex::new(None),
             anthropic_api_key: Mutex::new(None),
             whisper_model_path: Mutex::new(None),
+            http_client: reqwest::Client::new(),
+            whisper_context: Mutex::new(None),
             #[cfg(target_os = "macos")]
             previous_app_pid: Mutex::new(None),
         }
@@ -113,55 +124,69 @@ pub use whisper::{download_whisper_model, get_whisper_model_status, transcribe_a
 /// Check if the app is currently recording
 #[tauri::command]
 fn is_recording(state: State<AppState>) -> bool {
-    *state.is_recording.lock().unwrap()
+    state
+        .recording_handle
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
 }
 
 /// Save the frontmost app PID so we can reactivate it after pasting
 #[tauri::command]
-fn save_frontmost_app(state: State<AppState>) {
+async fn save_frontmost_app(app_handle: AppHandle) {
     #[cfg(target_os = "macos")]
     {
-        unsafe {
-            use objc::{msg_send, sel, sel_impl, class};
+        // Clone app_handle so it can be moved into the 'static closure
+        let handle = app_handle.clone();
 
-            // Get our own PID to exclude it
-            let our_pid: i32 = std::process::id() as i32;
+        let result = app_handle.run_on_main_thread(move || {
+            let state: State<AppState> = handle.state();
+            unsafe {
+                use objc::{msg_send, sel, sel_impl, class};
 
-            let workspace: cocoa::base::id = msg_send![class!(NSWorkspace), sharedWorkspace];
-            let frontmost: cocoa::base::id = msg_send![workspace, frontmostApplication];
-            if frontmost != cocoa::base::nil {
-                let pid: i32 = msg_send![frontmost, processIdentifier];
-                if pid != our_pid {
-                    log::info!("[FOCUS] Saved frontmost app PID: {} (not us: {})", pid, our_pid);
-                    *state.previous_app_pid.lock().unwrap() = Some(pid);
-                } else {
-                    // Frontmost is us — look through running apps for the most recently active one
-                    log::info!("[FOCUS] Frontmost is us (PID {}), searching for previous app...", our_pid);
-                    let running_apps: cocoa::base::id = msg_send![workspace, runningApplications];
-                    let count: usize = msg_send![running_apps, count];
-                    for i in 0..count {
-                        let app: cocoa::base::id = msg_send![running_apps, objectAtIndex: i];
-                        let app_pid: i32 = msg_send![app, processIdentifier];
-                        let is_active: cocoa::base::BOOL = msg_send![app, isActive];
-                        let activation_policy: i64 = msg_send![app, activationPolicy];
-                        // activationPolicy 0 = regular app (has dock icon)
-                        if app_pid != our_pid && activation_policy == 0 && is_active != cocoa::base::NO {
-                            log::info!("[FOCUS] Found active app PID: {}", app_pid);
-                            *state.previous_app_pid.lock().unwrap() = Some(app_pid);
-                            return;
+                // Get our own PID to exclude it
+                let our_pid: i32 = std::process::id() as i32;
+
+                let workspace: cocoa::base::id = msg_send![class!(NSWorkspace), sharedWorkspace];
+                let frontmost: cocoa::base::id = msg_send![workspace, frontmostApplication];
+                if frontmost != cocoa::base::nil {
+                    let pid: i32 = msg_send![frontmost, processIdentifier];
+                    if pid != our_pid {
+                        log::info!("[FOCUS] Saved frontmost app PID: {} (not us: {})", pid, our_pid);
+                        *state.previous_app_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(pid);
+                    } else {
+                        // Frontmost is us — look through running apps for the most recently active one
+                        log::info!("[FOCUS] Frontmost is us (PID {}), searching for previous app...", our_pid);
+                        let running_apps: cocoa::base::id = msg_send![workspace, runningApplications];
+                        let count: usize = msg_send![running_apps, count];
+                        for i in 0..count {
+                            let app: cocoa::base::id = msg_send![running_apps, objectAtIndex: i];
+                            let app_pid: i32 = msg_send![app, processIdentifier];
+                            let is_active: cocoa::base::BOOL = msg_send![app, isActive];
+                            let activation_policy: i64 = msg_send![app, activationPolicy];
+                            // activationPolicy 0 = regular app (has dock icon)
+                            if app_pid != our_pid && activation_policy == 0 && is_active != cocoa::base::NO {
+                                log::info!("[FOCUS] Found active app PID: {}", app_pid);
+                                *state.previous_app_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(app_pid);
+                                return;
+                            }
                         }
-                    }
-                    // If no active app found, try menuBarOwningApplication
-                    let menu_app: cocoa::base::id = msg_send![workspace, menuBarOwningApplication];
-                    if menu_app != cocoa::base::nil {
-                        let menu_pid: i32 = msg_send![menu_app, processIdentifier];
-                        if menu_pid != our_pid {
-                            log::info!("[FOCUS] Using menu bar app PID: {}", menu_pid);
-                            *state.previous_app_pid.lock().unwrap() = Some(menu_pid);
+                        // If no active app found, try menuBarOwningApplication
+                        let menu_app: cocoa::base::id = msg_send![workspace, menuBarOwningApplication];
+                        if menu_app != cocoa::base::nil {
+                            let menu_pid: i32 = msg_send![menu_app, processIdentifier];
+                            if menu_pid != our_pid {
+                                log::info!("[FOCUS] Using menu bar app PID: {}", menu_pid);
+                                *state.previous_app_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(menu_pid);
+                            }
                         }
                     }
                 }
             }
+        });
+
+        if let Err(e) = result {
+            log::error!("[FOCUS] run_on_main_thread failed: {:?}", e);
         }
     }
 }
@@ -232,6 +257,7 @@ async fn translate_text(
     provider: String,
     model: Option<String>,
     api_key: Option<String>,
+    state: State<'_, AppState>,
 ) -> Result<providers::TranslationResult, String> {
     let translation_provider = match provider.as_str() {
         "anthropic" => TranslationProvider::Anthropic,
@@ -249,7 +275,7 @@ async fn translate_text(
     };
 
     let t0 = std::time::Instant::now();
-    let result = providers::translate(&config, &text, &source_language, &target_language).await;
+    let result = providers::translate(&state.http_client, &config, &text, &source_language, &target_language).await;
     log::info!("[TIMING] Translation ({} via {}): {:?}", provider, config.model.as_deref().unwrap_or("default"), t0.elapsed());
     result
 }
@@ -327,101 +353,72 @@ pub struct OllamaStatus {
     pub error: Option<String>,
 }
 
-/// Copy text to clipboard and simulate paste (Cmd+V on macOS)
+/// Copy text to clipboard and switch focus back to the previously active app
 #[tauri::command(rename_all = "camelCase")]
 async fn copy_and_paste(text: String, app_handle: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let t0 = std::time::Instant::now();
     log::info!("[PASTE] Starting copy_and_paste, text length: {}", text.len());
 
-    // Copy to clipboard
+    // Copy to clipboard (arboard is safe from any thread)
     let mut clipboard = Clipboard::new().map_err(|e| format!("Failed to access clipboard: {}", e))?;
     clipboard.set_text(&text).map_err(|e| format!("Failed to copy to clipboard: {}", e))?;
     log::info!("[PASTE] Clipboard set: {:?}", t0.elapsed());
 
     #[cfg(target_os = "macos")]
     {
-        // Hide overlay if visible
+        // Hide overlay if visible (Tauri API is safe from any thread)
         if let Some(window) = app_handle.get_webview_window("overlay") {
             let _ = window.hide();
             log::info!("[PASTE] Overlay hidden");
         }
 
-        // Reactivate the app that was frontmost when recording started
-        let saved_pid = state.previous_app_pid.lock().unwrap().take();
-        if let Some(pid) = saved_pid {
-            log::info!("[PASTE] Reactivating app with PID: {}", pid);
-            unsafe {
-                use objc::{msg_send, sel, sel_impl, class};
-                let running_app: cocoa::base::id = msg_send![
-                    class!(NSRunningApplication),
-                    runningApplicationWithProcessIdentifier: pid
-                ];
-                if running_app != cocoa::base::nil {
-                    // NSApplicationActivateIgnoringOtherApps = 1 << 1 = 2
-                    let success: cocoa::base::BOOL = msg_send![
-                        running_app,
-                        activateWithOptions: 2u64
+        // Take the saved PID before moving into the closure
+        let saved_pid = state.previous_app_pid.lock().unwrap_or_else(|e| e.into_inner()).take();
+
+        // AppKit/NSRunningApplication calls MUST run on the main thread
+        let result = app_handle.run_on_main_thread(move || {
+            if let Some(pid) = saved_pid {
+                log::info!("[PASTE] Reactivating app with PID: {}", pid);
+                unsafe {
+                    use objc::{msg_send, sel, sel_impl, class};
+                    let running_app: cocoa::base::id = msg_send![
+                        class!(NSRunningApplication),
+                        runningApplicationWithProcessIdentifier: pid
                     ];
-                    log::info!("[PASTE] App activation result: {}", success);
-                } else {
-                    log::warn!("[PASTE] Could not find app with PID {}", pid);
+                    if running_app != cocoa::base::nil {
+                        // NSApplicationActivateIgnoringOtherApps = 1 << 1 = 2
+                        let success: cocoa::base::BOOL = msg_send![
+                            running_app,
+                            activateWithOptions: 2u64
+                        ];
+                        log::info!("[PASTE] App activation result: {}", success);
+                    } else {
+                        log::warn!("[PASTE] Could not find app with PID {}", pid);
+                    }
+                }
+            } else {
+                log::warn!("[PASTE] No saved frontmost app PID, hiding NSApp as fallback");
+                unsafe {
+                    use objc::{msg_send, sel, sel_impl};
+                    let ns_app: cocoa::base::id = msg_send![cocoa::appkit::NSApp(), self];
+                    let _: () = msg_send![ns_app, hide: cocoa::base::nil];
                 }
             }
-        } else {
-            log::warn!("[PASTE] No saved frontmost app PID, hiding NSApp as fallback");
-            unsafe {
-                use objc::{msg_send, sel, sel_impl};
-                let ns_app: cocoa::base::id = msg_send![cocoa::appkit::NSApp(), self];
-                let _: () = msg_send![ns_app, hide: cocoa::base::nil];
-            }
-        }
-        log::info!("[PASTE] Focus switch: {:?}", t0.elapsed());
+        });
 
-        // Wait for focus to settle + clipboard to propagate
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-        log::info!("[PASTE] Focus wait done: {:?}", t0.elapsed());
-
-        // Check accessibility permission before attempting paste
-        extern "C" {
-            fn AXIsProcessTrusted() -> bool;
-        }
-        let is_trusted = unsafe { AXIsProcessTrusted() };
-        if !is_trusted {
-            log::error!("[PASTE] Accessibility permission not granted");
-            return Err("Accessibility permission required for auto-paste. Enable it in System Settings > Privacy & Security > Accessibility.".to_string());
+        if let Err(e) = result {
+            log::error!("[PASTE] run_on_main_thread failed: {:?}", e);
         }
 
-        // Simulate Cmd+V via enigo (requires Accessibility permission)
-        match simulate_paste_macos() {
-            Ok(_) => log::info!("[PASTE] Paste simulated: {:?}", t0.elapsed()),
-            Err(e) => log::error!("[PASTE] Paste simulation failed: {}", e),
-        }
-        log::info!("[PASTE] Complete: {:?}", t0.elapsed());
+        log::info!("[PASTE] Focus switch dispatched: {:?}", t0.elapsed());
     }
 
     #[cfg(not(target_os = "macos"))]
     {
         let _ = app_handle;
-        return Err("Auto-paste only supported on macOS".to_string());
+        let _ = state;
+        return Err("Focus switch only supported on macOS".to_string());
     }
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn simulate_paste_macos() -> Result<(), String> {
-    use enigo::{Direction, Enigo, Key, Keyboard, Settings};
-
-    let mut enigo = Enigo::new(&Settings::default())
-        .map_err(|e| format!("Failed to create enigo: {}", e))?;
-
-    // Simulate Cmd+V
-    enigo.key(Key::Meta, Direction::Press)
-        .map_err(|e| format!("Failed to press Meta: {}", e))?;
-    enigo.key(Key::Unicode('v'), Direction::Click)
-        .map_err(|e| format!("Failed to click V: {}", e))?;
-    enigo.key(Key::Meta, Direction::Release)
-        .map_err(|e| format!("Failed to release Meta: {}", e))?;
 
     Ok(())
 }

@@ -67,10 +67,7 @@ arboard = "3"
 # macOS permissions (accessibility check/request)
 tauri-plugin-macos-permissions = "2"
 
-# Cross-platform input simulation (paste via Cmd+V)
-enigo = "0.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
 cocoa = "0.26"
-core-graphics = "0.24"

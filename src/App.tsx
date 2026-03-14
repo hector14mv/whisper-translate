@@ -38,6 +38,7 @@ function App() {
   } | null>(null);
   const saveTimeoutRef = useRef<number | null>(null);
   const isHotkeyRecordingRef = useRef(false);
+  const audioCtxRef = useRef<AudioContext | null>(null);
 
   const {
     recordingState,
@@ -92,6 +93,11 @@ function App() {
       }
     };
   }, [settings, settingsLoaded]);
+
+  // Cleanup AudioContext on unmount
+  useEffect(() => {
+    return () => { audioCtxRef.current?.close(); };
+  }, []);
 
   // Check accessibility permission on mount and when window regains focus
   useEffect(() => {
@@ -190,6 +196,24 @@ function App() {
       if (entry) {
         setHistory((prev) => [entry, ...prev].slice(0, MAX_HISTORY_ENTRIES));
         setSelectedEntry(null);
+
+        // Play completion sound — reuse a single AudioContext to avoid browser limit (~6 max)
+        try {
+          if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+            audioCtxRef.current = new AudioContext();
+          }
+          const ctx = audioCtxRef.current;
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.frequency.setValueAtTime(880, ctx.currentTime);
+          osc.frequency.setValueAtTime(1174.66, ctx.currentTime + 0.08);
+          gain.gain.setValueAtTime(0.3, ctx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.25);
+          osc.start(ctx.currentTime);
+          osc.stop(ctx.currentTime + 0.25);
+        } catch { /* ignore audio errors */ }
 
         // Always auto-paste result at cursor
         const textToPaste = entry.translated_text || entry.original_text;
