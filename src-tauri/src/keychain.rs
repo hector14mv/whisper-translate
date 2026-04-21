@@ -64,6 +64,20 @@ pub fn get_api_key(key_type: String) -> Result<Option<String>, String> {
     }
 }
 
+/// Check if an API key exists (non-command, for internal use)
+pub fn get_api_key_value(key_type: &str) -> Option<String> {
+    let account = match key_type {
+        "anthropic" => "anthropic_api_key",
+        "openai" => "openai_api_key",
+        "google" => "google_api_key",
+        _ => return None,
+    };
+    match get_generic_password(SERVICE_NAME, account) {
+        Ok(password) => String::from_utf8(password.to_vec()).ok(),
+        Err(_) => None,
+    }
+}
+
 /// Delete an API key from the macOS Keychain
 #[tauri::command(rename_all = "camelCase")]
 pub fn delete_api_key(key_type: String) -> Result<(), String> {

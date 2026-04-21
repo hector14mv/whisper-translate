@@ -21,6 +21,8 @@ export interface AppSettings {
   global_hotkey_enabled: boolean;
   global_hotkey: string;
   double_tap_interval: number;
+  auto_paste_enabled: boolean;
+  sound_feedback: boolean;
 }
 
 export type OverlayState = 'recording' | 'processing' | 'hidden';

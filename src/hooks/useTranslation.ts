@@ -63,10 +63,9 @@ export function useTranslation(): UseTranslationReturn {
         return entry;
       }
 
-      // Step 2: Get the API key (if needed for this provider)
+      // Step 2: Get API key from Keychain if the provider needs one
       let apiKey: string | undefined;
       const apiKeyType = getApiKeyTypeForProvider(provider);
-
       if (apiKeyType) {
         const key = await getApiKey(apiKeyType);
         if (!key) {
@@ -85,7 +84,7 @@ export function useTranslation(): UseTranslationReturn {
         targetLanguage,
         provider,
         model,
-        apiKey
+        apiKey,
       );
       setTranslation(translationResult);
 

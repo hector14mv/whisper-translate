@@ -1,16 +1,10 @@
 import { invoke } from '@tauri-apps/api/core';
-import {
-  checkAccessibilityPermission as checkAccessibility,
-  requestAccessibilityPermission as requestAccessibility,
-} from 'tauri-plugin-macos-permissions-api';
 import type {
-  AudioDeviceInfo,
   WhisperModelInfo,
   TranscriptionResult,
   TranslationResult,
   AppSettings,
   TranslationProvider,
-  ModelInfo,
   ProviderInfo,
   OllamaStatus,
 } from '../types';
@@ -22,14 +16,6 @@ export async function startRecording(): Promise<string> {
 
 export async function stopRecording(): Promise<string> {
   return invoke<string>('stop_recording');
-}
-
-export async function getAudioDevices(): Promise<AudioDeviceInfo[]> {
-  return invoke<AudioDeviceInfo[]>('get_audio_devices');
-}
-
-export async function isRecording(): Promise<boolean> {
-  return invoke<boolean>('is_recording');
 }
 
 // Keychain commands
@@ -75,7 +61,7 @@ export async function translateText(
   targetLanguage: string,
   provider: TranslationProvider,
   model?: string,
-  apiKey?: string
+  apiKey?: string,
 ): Promise<TranslationResult> {
   return invoke<TranslationResult>('translate_text', {
     text,
@@ -85,10 +71,6 @@ export async function translateText(
     model,
     apiKey,
   });
-}
-
-export async function getProviderModels(provider: TranslationProvider): Promise<ModelInfo[]> {
-  return invoke<ModelInfo[]>('get_provider_models', { provider });
 }
 
 export async function getProviderInfo(provider: TranslationProvider): Promise<ProviderInfo> {
@@ -132,15 +114,6 @@ export async function saveFrontmostApp(): Promise<void> {
   return invoke('save_frontmost_app');
 }
 
-// Accessibility permission
-export async function checkAccessibilityPermission(): Promise<boolean> {
-  return checkAccessibility();
-}
-
-export async function requestAccessibilityPermission(): Promise<void> {
-  await requestAccessibility();
-}
-
 // Overlay commands
 export async function showOverlay(): Promise<void> {
   return invoke('show_overlay');
@@ -148,4 +121,33 @@ export async function showOverlay(): Promise<void> {
 
 export async function hideOverlay(): Promise<void> {
   return invoke('hide_overlay');
+}
+
+// Tray sync commands
+export async function updateTrayHotkey(hotkey: string | null): Promise<void> {
+  return invoke('update_tray_hotkey', { hotkey });
+}
+
+export async function updateTrayFillerWords(enabled: boolean): Promise<void> {
+  return invoke('update_tray_filler_words', { enabled });
+}
+
+export async function updateTrayAutoPaste(enabled: boolean): Promise<void> {
+  return invoke('update_tray_auto_paste', { enabled });
+}
+
+export async function updateTrayTranslation(enabled: boolean): Promise<void> {
+  return invoke('update_tray_translation', { enabled });
+}
+
+export async function updateTraySoundFeedback(enabled: boolean): Promise<void> {
+  return invoke('update_tray_sound_feedback', { enabled });
+}
+
+export async function updateTrayRecordLabel(isRecording: boolean): Promise<void> {
+  return invoke('update_tray_record_label', { isRecording });
+}
+
+export async function playSound(name: string): Promise<void> {
+  return invoke('play_sound', { name });
 }
