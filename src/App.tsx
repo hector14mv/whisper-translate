@@ -67,7 +67,7 @@ function App() {
     global_hotkey_enabled: false,
     global_hotkey: 'Alt+Space',
     double_tap_interval: 400,
-    auto_paste_enabled: true,
+    auto_paste_enabled: false,
     sound_feedback: false,
   });
   const [settingsLoaded, setSettingsLoaded] = useState(false);
@@ -114,9 +114,11 @@ function App() {
     }, 500);
     return () => {
       if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
-      audioCtxRef.current?.close();
     };
   }, [settings, settingsLoaded]);
+
+  // Close AudioContext singleton only on unmount (not on every settings change)
+  useEffect(() => () => { audioCtxRef.current?.close(); }, []);
 
   // Sync tray hotkey
   useEffect(() => {

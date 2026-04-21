@@ -114,7 +114,7 @@ fn default_double_tap_interval() -> u32 {
 }
 
 fn default_auto_paste() -> bool {
-    true
+    false
 }
 
 fn default_sound_feedback() -> bool {
@@ -135,7 +135,7 @@ impl Default for AppSettings {
             global_hotkey_enabled: false,
             global_hotkey: "CommandOrControl+Shift+Space".to_string(),
             double_tap_interval: 400,
-            auto_paste_enabled: true,
+            auto_paste_enabled: false,
             sound_feedback: false,
         }
     }
@@ -441,10 +441,13 @@ async fn copy_and_paste(text: String, app_handle: AppHandle, state: State<'_, Ap
         // the focus switch so the synthesized keystroke lands in the right app.
         if get_settings().auto_paste_enabled {
             tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
-            if let Err(e) = simulate_paste_macos() {
-                log::warn!("[PASTE] Cmd+V simulation failed: {}", e);
-            } else {
-                log::info!("[PASTE] Cmd+V simulated: {:?}", t0.elapsed());
+            // Run the sync CGEvent calls off the async worker so the 10ms gap
+            // between key_down / key_up doesn't stall the Tokio event loop.
+            let paste_result = tokio::task::spawn_blocking(simulate_paste_macos).await;
+            match paste_result {
+                Ok(Ok(())) => log::info!("[PASTE] Cmd+V simulated: {:?}", t0.elapsed()),
+                Ok(Err(e)) => log::warn!("[PASTE] Cmd+V simulation failed: {}", e),
+                Err(e) => log::warn!("[PASTE] Cmd+V spawn_blocking join failed: {}", e),
             }
         }
     }
@@ -459,6 +462,9 @@ async fn copy_and_paste(text: String, app_handle: AppHandle, state: State<'_, Ap
     Ok(())
 }
 
+// CGEventSource / CGEvent are not Send, so they can't cross a .await.
+// We keep this function sync and call it from a spawn_blocking task so the
+// 10ms gap between key_down and key_up runs off the async worker thread.
 #[cfg(target_os = "macos")]
 fn simulate_paste_macos() -> Result<(), String> {
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
