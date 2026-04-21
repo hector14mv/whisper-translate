@@ -61,6 +61,10 @@ chrono = { version = "0.4", features = ["serde"] }
 # Directory paths
 dirs = "5.0"
 
+# Image composition (tray icon: base logo + optional pulsing red dot).
+# Default-features off — we feed raw RGBA from Tauri, no PNG decoding needed.
+image = { version = "0.25", default-features = false }
+
 # Clipboard access
 arboard = "3"
 

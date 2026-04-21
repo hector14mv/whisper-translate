@@ -128,10 +128,6 @@ export async function updateTrayHotkey(hotkey: string | null): Promise<void> {
   return invoke('update_tray_hotkey', { hotkey });
 }
 
-export async function updateTrayFillerWords(enabled: boolean): Promise<void> {
-  return invoke('update_tray_filler_words', { enabled });
-}
-
 export async function updateTrayAutoPaste(enabled: boolean): Promise<void> {
   return invoke('update_tray_auto_paste', { enabled });
 }
@@ -140,14 +136,6 @@ export async function updateTrayTranslation(enabled: boolean): Promise<void> {
   return invoke('update_tray_translation', { enabled });
 }
 
-export async function updateTraySoundFeedback(enabled: boolean): Promise<void> {
-  return invoke('update_tray_sound_feedback', { enabled });
-}
-
 export async function updateTrayRecordLabel(isRecording: boolean): Promise<void> {
   return invoke('update_tray_record_label', { isRecording });
-}
-
-export async function playSound(name: string): Promise<void> {
-  return invoke('play_sound', { name });
 }
