@@ -710,6 +710,8 @@ pub fn run() {
                 .separator()
                 .item(&auto_paste)
                 .item(&translation_item)
+                .item(&filler_words_item)
+                .item(&sound_feedback_item)
                 .separator()
                 .item(&history_item)
                 .item(&settings_item)
