@@ -405,7 +405,7 @@ export function SettingsPanel({
                 />
                 <ToggleRow
                   label="Sound Feedback"
-                  description="Play sound on start/stop recording"
+                  description="Play a tone when recording starts and when the transcription is ready"
                   checked={settings.sound_feedback}
                   onChange={() => onSettingsChange({ ...settings, sound_feedback: !settings.sound_feedback })}
                 />

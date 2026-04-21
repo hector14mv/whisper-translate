@@ -10,20 +10,180 @@ use providers::{ModelInfo, ProviderConfig, TranslationProvider};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, CheckMenuItemBuilder, MenuBuilder, MenuItem, MenuItemBuilder};
-use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::tray::{TrayIcon, TrayIconBuilder};
+use tauri::{AppHandle, Emitter, Listener, Manager, State, WebviewUrl, WebviewWindowBuilder, Wry};
 use whisper_rs::WhisperContext;
 
-/// Tray menu state — keeps references to menu items so we can update them from commands
+/// Tray menu state — keeps references to menu items so we can update them from commands.
+/// Only holds the items that actually appear in the tray (the two mid-workflow toggles
+/// plus the Record label / hotkey). Other settings live in the Settings window.
 pub struct TrayState {
     pub record_item: MenuItem<tauri::Wry>,
     pub auto_paste_item: CheckMenuItem<tauri::Wry>,
     pub translation_item: CheckMenuItem<tauri::Wry>,
-    pub filler_words_item: CheckMenuItem<tauri::Wry>,
-    pub sound_feedback_item: CheckMenuItem<tauri::Wry>,
+}
+
+/// One precomputed tray icon frame (raw RGBA, dimensions).
+struct IconFrame {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+impl IconFrame {
+    fn as_image(&self) -> Image<'_> {
+        Image::new(&self.rgba, self.width, self.height)
+    }
+}
+
+/// Precomputed frames for every tray state. All share the same canvas size,
+/// so switching between them never shifts the icon's position.
+struct TrayIcons {
+    idle: IconFrame,           // bare logo, no dot
+    rec_bright: IconFrame,     // red dot, full alpha
+    rec_dim: IconFrame,        // red dot, ~43% alpha
+    proc_big: IconFrame,       // blue dot, full size
+    proc_small: IconFrame,     // blue dot, shrunk — pair with big for a "pump"
+    done: IconFrame,           // green dot, fully saturated
+}
+
+/// Owns the live tray handle plus a generation counter. Every state change
+/// (set_recording / set_processing / set_done / set_idle) bumps `generation`;
+/// any animation thread still running from a previous state compares its
+/// captured generation against the current one on each tick and exits when
+/// they no longer match. This makes "restart the animation" free and correct
+/// — we don't need to track / join threads explicitly.
+pub struct TrayPulse {
+    tray: TrayIcon<Wry>,
+    icons: Arc<TrayIcons>,
+    generation: Arc<AtomicU64>,
+}
+
+impl TrayPulse {
+    /// Bump the generation, returning the new value. Any thread spawned against
+    /// a previous value will see the mismatch and bail out on its next tick.
+    fn advance(&self) -> u64 {
+        // fetch_add returns the OLD value; we want the new one.
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn set_idle(&self) {
+        self.advance();
+        let _ = self.tray.set_icon(Some(self.icons.idle.as_image()));
+    }
+
+    fn set_recording(&self) {
+        let gen = self.advance();
+        let tray = self.tray.clone();
+        let icons = self.icons.clone();
+        let generation = self.generation.clone();
+        std::thread::spawn(move || {
+            // Slow breathing (600ms per half-cycle) by alpha.
+            let mut bright = true;
+            while generation.load(Ordering::SeqCst) == gen {
+                let frame = if bright { &icons.rec_bright } else { &icons.rec_dim };
+                let _ = tray.set_icon(Some(frame.as_image()));
+                bright = !bright;
+                std::thread::sleep(Duration::from_millis(600));
+            }
+        });
+    }
+
+    fn set_processing(&self) {
+        let gen = self.advance();
+        let tray = self.tray.clone();
+        let icons = self.icons.clone();
+        let generation = self.generation.clone();
+        std::thread::spawn(move || {
+            // Faster "pump" (300ms per half-cycle) by size. Reads as "something
+            // is actively working" vs the calmer alpha breathing of recording.
+            let mut big = true;
+            while generation.load(Ordering::SeqCst) == gen {
+                let frame = if big { &icons.proc_big } else { &icons.proc_small };
+                let _ = tray.set_icon(Some(frame.as_image()));
+                big = !big;
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        });
+    }
+
+    fn set_done(&self) {
+        let gen = self.advance();
+        // Green is held static for 1.5s, then auto-reverts to idle. A fresh
+        // set_recording / set_processing / set_idle during the hold bumps the
+        // generation and the delayed idle-revert below becomes a no-op.
+        let _ = self.tray.set_icon(Some(self.icons.done.as_image()));
+        let tray = self.tray.clone();
+        let icons = self.icons.clone();
+        let generation = self.generation.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            if generation.load(Ordering::SeqCst) == gen {
+                let _ = tray.set_icon(Some(icons.idle.as_image()));
+            }
+        });
+    }
+}
+
+/// Compose every tray frame from the base logo. Paints a filled circle to the
+/// right of the logo with a gap, at the requested RGBA and size scale (1.0 =
+/// full "dot_size" diameter, smaller values shrink it while keeping the same
+/// centre). `None` skips the circle entirely — used for the idle frame so the
+/// logo sits on the wider canvas and the icon never shifts when the dot
+/// appears mid-workflow.
+fn build_tray_icons(base: &Image<'_>) -> Result<TrayIcons, String> {
+    let base_w = base.width();
+    let base_h = base.height();
+    let base_rgba = image::RgbaImage::from_raw(base_w, base_h, base.rgba().to_vec())
+        .ok_or("Base tray icon has unexpected pixel count")?;
+
+    // Dot takes ~40% of the height, gap is ~15%. Tuned to be distinct from the
+    // logo at menu-bar size (22pt) without crowding it.
+    let dot_size = (base_h as f32 * 0.40).round().max(6.0) as u32;
+    let gap = (base_h as f32 * 0.15).round().max(2.0) as u32;
+    let canvas_w = base_w + gap + dot_size;
+    let canvas_h = base_h;
+
+    let compose = |color: Option<(u8, u8, u8, u8)>, size_scale: f32| -> IconFrame {
+        let mut canvas = image::RgbaImage::new(canvas_w, canvas_h);
+        image::imageops::overlay(&mut canvas, &base_rgba, 0, 0);
+        if let Some((dr, dg, db, alpha)) = color {
+            let cx = (base_w + gap + dot_size / 2) as i32;
+            let cy = (canvas_h / 2) as i32;
+            let r = ((dot_size as f32 * 0.5) * size_scale).round().max(1.0) as i32;
+            let r_sq = r * r;
+            // Straight RGBA; set_icon does not expect pre-multiplication.
+            for y in (cy - r).max(0)..(cy + r + 1).min(canvas_h as i32) {
+                for x in (cx - r).max(0)..(cx + r + 1).min(canvas_w as i32) {
+                    let dx = x - cx;
+                    let dy = y - cy;
+                    if dx * dx + dy * dy <= r_sq {
+                        canvas.put_pixel(x as u32, y as u32, image::Rgba([dr, dg, db, alpha]));
+                    }
+                }
+            }
+        }
+        IconFrame {
+            rgba: canvas.into_raw(),
+            width: canvas_w,
+            height: canvas_h,
+        }
+    };
+
+    // Tailwind-ish accents: red-600, blue-600, green-500.
+    Ok(TrayIcons {
+        idle: compose(None, 1.0),
+        rec_bright: compose(Some((220, 38, 38, 255)), 1.0),
+        rec_dim: compose(Some((220, 38, 38, 110)), 1.0),
+        proc_big: compose(Some((37, 99, 235, 255)), 1.0),
+        proc_small: compose(Some((37, 99, 235, 255)), 0.6),
+        done: compose(Some((34, 197, 94, 255)), 1.0),
+    })
 }
 
 
@@ -544,16 +704,6 @@ fn update_tray_auto_paste(enabled: bool, state: State<TrayState>) -> Result<(), 
     Ok(())
 }
 
-/// Sync sound feedback checkbox in tray with settings
-#[tauri::command]
-fn update_tray_sound_feedback(enabled: bool, state: State<TrayState>) -> Result<(), String> {
-    state
-        .sound_feedback_item
-        .set_checked(enabled)
-        .map_err(|e| format!("Failed to set sound feedback: {}", e))?;
-    Ok(())
-}
-
 /// Sync translation checkbox in tray with settings
 #[tauri::command]
 fn update_tray_translation(enabled: bool, state: State<TrayState>) -> Result<(), String> {
@@ -561,16 +711,6 @@ fn update_tray_translation(enabled: bool, state: State<TrayState>) -> Result<(),
         .translation_item
         .set_checked(enabled)
         .map_err(|e| format!("Failed to set translation: {}", e))?;
-    Ok(())
-}
-
-/// Sync filler words checkbox in tray with settings
-#[tauri::command]
-fn update_tray_filler_words(enabled: bool, state: State<TrayState>) -> Result<(), String> {
-    state
-        .filler_words_item
-        .set_checked(enabled)
-        .map_err(|e| format!("Failed to set filler words: {}", e))?;
     Ok(())
 }
 
@@ -601,40 +741,6 @@ fn update_tray_hotkey(hotkey: Option<String>, state: State<TrayState>) -> Result
                 .set_accelerator(None::<&str>)
                 .map_err(|e| format!("Failed to clear accelerator: {}", e))?;
         }
-    }
-    Ok(())
-}
-
-/// Play a macOS system sound. Name is whitelisted so a malicious frontend
-/// can't coax afplay into touching arbitrary filesystem paths via traversal.
-/// Uses Command::spawn() + detached Child (no blocking thread parked on output()).
-#[tauri::command]
-fn play_sound(name: String) -> Result<(), String> {
-    const ALLOWED: &[&str] = &[
-        "Tink", "Glass", "Pop", "Ping", "Funk", "Hero", "Morse", "Submarine", "Bottle",
-    ];
-    if !ALLOWED.contains(&name.as_str()) {
-        return Err(format!("Sound '{}' is not in the allow-list", name));
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        use std::process::{Command, Stdio};
-        let sound_path = format!("/System/Library/Sounds/{}.aiff", name);
-        // Fire-and-forget: spawn detaches the child; we don't wait, we don't
-        // park a thread, we don't leak a Child that still owns fds after
-        // afplay exits ~200ms later.
-        Command::new("afplay")
-            .arg(&sound_path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .stdin(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn afplay: {}", e))?;
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = name;
     }
     Ok(())
 }
@@ -734,14 +840,8 @@ pub fn run() {
             let auto_paste = CheckMenuItemBuilder::with_id("auto_paste", "Auto-paste")
                 .checked(settings.auto_paste_enabled)
                 .build(app)?;
-            let filler_words_item = CheckMenuItemBuilder::with_id("filler_words", "Remove Filler Words")
-                .checked(settings.remove_filler_words)
-                .build(app)?;
             let translation_item = CheckMenuItemBuilder::with_id("translation", "Translate")
                 .checked(settings.translation_enabled)
-                .build(app)?;
-            let sound_feedback_item = CheckMenuItemBuilder::with_id("sound_feedback", "Sound Feedback")
-                .checked(settings.sound_feedback)
                 .build(app)?;
 
             let history_item = MenuItemBuilder::with_id("history", "History").build(app)?;
@@ -749,13 +849,15 @@ pub fn run() {
             let restart_item = MenuItemBuilder::with_id("restart", "Restart App").build(app)?;
             let quit_item = MenuItemBuilder::with_id("quit", "Quit App").build(app)?;
 
+            // Tray menu intentionally exposes only the two toggles users flip
+            // mid-workflow (Auto-paste, Translate). Remove-Filler-Words and
+            // Sound-Feedback live in Settings — they're setup-time choices, not
+            // per-recording decisions.
             let menu = MenuBuilder::new(app)
                 .item(&record_item)
                 .separator()
                 .item(&auto_paste)
                 .item(&translation_item)
-                .item(&filler_words_item)
-                .item(&sound_feedback_item)
                 .separator()
                 .item(&history_item)
                 .item(&settings_item)
@@ -768,8 +870,6 @@ pub fn run() {
                 record_item: record_item.clone(),
                 auto_paste_item: auto_paste.clone(),
                 translation_item: translation_item.clone(),
-                filler_words_item: filler_words_item.clone(),
-                sound_feedback_item: sound_feedback_item.clone(),
             });
 
             // Helper: focus-then-emit ordering for tray → webview navigation.
@@ -784,12 +884,14 @@ pub fn run() {
                 }
             }
 
-            let _tray = TrayIconBuilder::new()
-                .icon(
-                    app.default_window_icon()
-                        .ok_or("No default window icon configured in tauri.conf.json")?
-                        .clone(),
-                )
+            let base_icon = app
+                .default_window_icon()
+                .ok_or("No default window icon configured in tauri.conf.json")?
+                .clone();
+            let tray_icons = Arc::new(build_tray_icons(&base_icon)?);
+
+            let tray = TrayIconBuilder::new()
+                .icon(tray_icons.idle.as_image())
                 .tooltip("Whisper Translate")
                 .menu(&menu)
                 .show_menu_on_left_click(true)
@@ -865,6 +967,42 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            // Manage the pulse controller so event listeners below can drive
+            // the tray through its four states.
+            app.manage(TrayPulse {
+                tray: tray.clone(),
+                icons: tray_icons.clone(),
+                generation: Arc::new(AtomicU64::new(0)),
+            });
+
+            // audio.rs emits "recording" / "idle" when the capture thread
+            // starts / stops. The frontend also emits "processing" on this
+            // same channel once recording has ended and transcription begins.
+            // Payloads arrive JSON-encoded (e.g. "\"recording\"") so we strip
+            // the quotes before matching.
+            let handle_for_state = app.handle().clone();
+            app.listen("recording-state-change", move |event| {
+                if let Some(pulse) = handle_for_state.try_state::<TrayPulse>() {
+                    match event.payload().trim_matches('"') {
+                        "recording" => pulse.set_recording(),
+                        "processing" => pulse.set_processing(),
+                        "idle" => pulse.set_idle(),
+                        _ => {}
+                    }
+                }
+            });
+
+            // Frontend fires this once the transcription result has been
+            // written to the clipboard (and/or auto-pasted into the previous
+            // app). Green holds for 1.5s, then set_done's own timer reverts
+            // to idle unless something else has changed state meanwhile.
+            let handle_for_done = app.handle().clone();
+            app.listen("paste-complete", move |_event| {
+                if let Some(pulse) = handle_for_done.try_state::<TrayPulse>() {
+                    pulse.set_done();
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -898,12 +1036,9 @@ pub fn run() {
             hide_overlay,
             // Tray sync commands
             update_tray_hotkey,
-            update_tray_filler_words,
             update_tray_auto_paste,
             update_tray_translation,
-            update_tray_sound_feedback,
             update_tray_record_label,
-            play_sound,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

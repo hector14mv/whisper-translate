@@ -4,7 +4,7 @@ import { SettingsPanel } from './components/SettingsPanel';
 import { useAudioRecorder } from './hooks/useAudioRecorder';
 import { useTranslation } from './hooks/useTranslation';
 import { useGlobalHotkey } from './hooks/useGlobalHotkey';
-import { getApiKey, getWhisperModelStatus, checkOllamaStatus, getApiKeyTypeForProvider, getSettings, saveSettings, copyAndPaste, showOverlay, hideOverlay, saveFrontmostApp, updateTrayHotkey, updateTrayFillerWords, updateTrayAutoPaste, updateTrayTranslation, updateTraySoundFeedback, updateTrayRecordLabel, playSound } from './lib/tauri';
+import { getApiKey, getWhisperModelStatus, checkOllamaStatus, getApiKeyTypeForProvider, getSettings, saveSettings, copyAndPaste, showOverlay, hideOverlay, saveFrontmostApp, updateTrayHotkey, updateTrayAutoPaste, updateTrayTranslation, updateTrayRecordLabel } from './lib/tauri';
 import type { TranslationEntry, AppSettings } from './types';
 import { PROVIDER_DISPLAY_INFO, GLOBAL_HOTKEY_OPTIONS } from './types';
 import './index.css';
@@ -77,6 +77,7 @@ function App() {
   const [setupNeeded, setSetupNeeded] = useState<string | null>(null);
   const [expandedEntry, setExpandedEntry] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
   const saveTimeoutRef = useRef<number | null>(null);
   const isHotkeyRecordingRef = useRef(false);
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -123,18 +124,46 @@ function App() {
   // Close AudioContext singleton only on unmount (not on every settings change)
   useEffect(() => () => { audioCtxRef.current?.close(); }, []);
 
+  // Short two-note cue. Reuses the singleton AudioContext to avoid hitting the
+  // browser's ~6-context limit after many recordings.
+  const playCue = useCallback((startFreq: number, endFreq: number) => {
+    try {
+      if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+        audioCtxRef.current = new AudioContext();
+      }
+      const ctx = audioCtxRef.current;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.frequency.setValueAtTime(startFreq, ctx.currentTime);
+      osc.frequency.setValueAtTime(endFreq, ctx.currentTime + 0.08);
+      gain.gain.setValueAtTime(0.3, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.25);
+      osc.start(ctx.currentTime);
+      osc.stop(ctx.currentTime + 0.25);
+    } catch { /* ignore audio errors */ }
+  }, []);
+
+  // Continuously remember the last frontmost application that isn't us.
+  // The tray icon makes Whisper Translate frontmost the instant a user clicks
+  // it, so asking "who's frontmost?" at paste time always answers "us".
+  // Polling once per second means that by the time we paste, AppState has a
+  // fresh PID from before we stole focus. Cheap: one AppleScript-ish syscall
+  // via NSWorkspace, handled on the main thread in Rust.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      saveFrontmostApp().catch(() => {});
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
+
   // Sync tray hotkey
   useEffect(() => {
     if (!settingsLoaded) return;
     const hotkey = settings.global_hotkey_enabled ? settings.global_hotkey : null;
     updateTrayHotkey(hotkey).catch(console.error);
   }, [settings.global_hotkey_enabled, settings.global_hotkey, settingsLoaded]);
-
-  // Sync tray filler words
-  useEffect(() => {
-    if (!settingsLoaded) return;
-    updateTrayFillerWords(settings.remove_filler_words).catch(console.error);
-  }, [settings.remove_filler_words, settingsLoaded]);
 
   // Sync tray auto-paste
   useEffect(() => {
@@ -147,12 +176,6 @@ function App() {
     if (!settingsLoaded) return;
     updateTrayTranslation(settings.translation_enabled).catch(console.error);
   }, [settings.translation_enabled, settingsLoaded]);
-
-  // Sync tray sound feedback
-  useEffect(() => {
-    if (!settingsLoaded) return;
-    updateTraySoundFeedback(settings.sound_feedback).catch(console.error);
-  }, [settings.sound_feedback, settingsLoaded]);
 
   // Check setup
   useEffect(() => { checkSetup(); }, []);
@@ -191,7 +214,9 @@ function App() {
   // Recording handlers
   const handleStopRecording = useCallback(async (fromHotkey = false) => {
     updateTrayRecordLabel(false).catch(() => {});
-    if (fromHotkey) emit('recording-state-change', 'processing');
+    // Flip the tray dot to blue as soon as we stop capturing audio — works for
+    // both hotkey and tray/click triggers (previous code only did it for hotkey).
+    emit('recording-state-change', 'processing');
     const audioPath = await stopAudioRecording();
     if (audioPath) {
       const entry = await processAudio(audioPath, settings.whisper_model, settings.target_language, settings.translation_provider, settings.translation_model, settings.translation_enabled, settings.remove_filler_words);
@@ -202,23 +227,8 @@ function App() {
           return updated;
         });
 
-        // Completion "plim" (880 → 1174Hz) — reuse singleton AudioContext
-        try {
-          if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
-            audioCtxRef.current = new AudioContext();
-          }
-          const ctx = audioCtxRef.current;
-          const osc = ctx.createOscillator();
-          const gain = ctx.createGain();
-          osc.connect(gain);
-          gain.connect(ctx.destination);
-          osc.frequency.setValueAtTime(880, ctx.currentTime);
-          osc.frequency.setValueAtTime(1174.66, ctx.currentTime + 0.08);
-          gain.gain.setValueAtTime(0.3, ctx.currentTime);
-          gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.25);
-          osc.start(ctx.currentTime);
-          osc.stop(ctx.currentTime + 0.25);
-        } catch { /* ignore audio errors */ }
+        // Completion cue (high: 880 → 1174Hz)
+        if (settings.sound_feedback) playCue(880, 1174.66);
 
         const textToPaste = entry.translated_text || entry.original_text;
         if (textToPaste) {
@@ -229,47 +239,60 @@ function App() {
             // Just copy to clipboard
             try { await navigator.clipboard.writeText(textToPaste); } catch (err) { console.error(err); }
           }
+          // Text reached its destination (clipboard and/or editor) → tray turns
+          // green for 1.5s. The backend handles the auto-revert to idle.
+          emit('paste-complete');
+        } else {
+          // Nothing pasted — no green flash, just go back to idle.
+          emit('recording-state-change', 'idle');
         }
+      } else {
+        // processAudio returned nothing (e.g. silence) — clear the blue dot.
+        emit('recording-state-change', 'idle');
       }
       if (fromHotkey) { try { await hideOverlay(); } catch {} }
-    } else if (fromHotkey) { try { await hideOverlay(); } catch {} }
-  }, [stopAudioRecording, processAudio, settings.whisper_model, settings.target_language, settings.translation_provider, settings.translation_model, settings.translation_enabled, settings.remove_filler_words, settings.auto_paste_enabled]);
+    } else {
+      // stopAudioRecording failed to produce a file — revert tray to idle.
+      emit('recording-state-change', 'idle');
+      if (fromHotkey) { try { await hideOverlay(); } catch {} }
+    }
+  }, [stopAudioRecording, processAudio, settings.whisper_model, settings.target_language, settings.translation_provider, settings.translation_model, settings.translation_enabled, settings.remove_filler_words, settings.auto_paste_enabled, settings.sound_feedback, playCue]);
 
   const handleToggleRecording = useCallback(async () => {
     if (setupNeeded) return;
     if (recordingState === 'idle') {
       isHotkeyRecordingRef.current = true;
       saveFrontmostApp().catch(() => {});
-      if (settings.sound_feedback) playSound('Tink').catch(() => {});
+      // Start cue (low: 523 → 784Hz) — paired with the completion cue in
+      // handleStopRecording. Both gated by the Sound Feedback setting.
+      if (settings.sound_feedback) playCue(523.25, 784);
       startRecording();
       updateTrayRecordLabel(true).catch(() => {});
       showOverlay().catch(console.error);
     } else if (recordingState === 'recording') {
-      if (settings.sound_feedback) playSound('Glass').catch(() => {});
       updateTrayRecordLabel(false).catch(() => {});
       const wasHotkey = isHotkeyRecordingRef.current;
       isHotkeyRecordingRef.current = false;
       handleStopRecording(wasHotkey);
     }
-  }, [setupNeeded, recordingState, startRecording, handleStopRecording, settings.sound_feedback]);
+  }, [setupNeeded, recordingState, startRecording, handleStopRecording, settings.sound_feedback, playCue]);
 
   const handleGlobalHotkeyPressed = useCallback(async () => {
     if (setupNeeded || recordingState !== 'idle') return;
     isHotkeyRecordingRef.current = true;
     saveFrontmostApp().catch(() => {});
-    if (settings.sound_feedback) playSound('Tink').catch(() => {});
+    if (settings.sound_feedback) playCue(523.25, 784);
     startRecording();
     updateTrayRecordLabel(true).catch(() => {});
-  }, [setupNeeded, recordingState, startRecording, settings.sound_feedback]);
+  }, [setupNeeded, recordingState, startRecording, settings.sound_feedback, playCue]);
 
   const handleGlobalHotkeyReleased = useCallback(() => {
     if (recordingState !== 'recording') return;
-    if (settings.sound_feedback) playSound('Glass').catch(() => {});
     updateTrayRecordLabel(false).catch(() => {});
     const wasHotkey = isHotkeyRecordingRef.current;
     isHotkeyRecordingRef.current = false;
     handleStopRecording(wasHotkey);
-  }, [recordingState, handleStopRecording, settings.sound_feedback]);
+  }, [recordingState, handleStopRecording]);
 
   const isDoubleTapMode = settings.recording_mode === 'double_tap';
 
@@ -315,7 +338,18 @@ function App() {
     setHistory([]);
     persistHistory([]);
     setExpandedEntry(null);
+    setShowClearConfirm(false);
   }, []);
+
+  // Esc closes the confirm dialog
+  useEffect(() => {
+    if (!showClearConfirm) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowClearConfirm(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showClearConfirm]);
 
   const error = recordingError || translationError;
   const hotkeyLabel = GLOBAL_HOTKEY_OPTIONS.find(o => o.id === settings.global_hotkey)?.label || settings.global_hotkey;
@@ -340,9 +374,13 @@ function App() {
 
         <div className="flex items-center gap-1.5" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
           {history.length > 0 && (
-            <button onClick={handleClearHistory} className="icon-btn" title="Clear history">
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+            <button onClick={() => setShowClearConfirm(true)} className="icon-btn" title="Clear history" aria-label="Clear history">
+              <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.75} strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24">
+                <path d="M3 6h18" />
+                <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                <path d="M10 11v6" />
+                <path d="M14 11v6" />
               </svg>
             </button>
           )}
@@ -510,6 +548,48 @@ function App() {
         onSettingsChange={setSettings}
         initialTab={settingsTab}
       />
+
+      {/* Clear-history confirm dialog */}
+      {showClearConfirm && (
+        <div
+          className="confirm-backdrop"
+          onClick={() => setShowClearConfirm(false)}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="confirm-clear-title"
+        >
+          <div
+            className="confirm-dialog"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div id="confirm-clear-title" className="confirm-title">
+              Clear all history?
+            </div>
+            <div className="confirm-description">
+              {history.length === 1
+                ? '1 entry will be removed permanently. This cannot be undone.'
+                : `${history.length} entries will be removed permanently. This cannot be undone.`}
+            </div>
+            <div className="confirm-actions">
+              <button
+                type="button"
+                className="confirm-btn confirm-btn-cancel"
+                onClick={() => setShowClearConfirm(false)}
+                autoFocus
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="confirm-btn confirm-btn-destructive"
+                onClick={handleClearHistory}
+              >
+                Clear
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
