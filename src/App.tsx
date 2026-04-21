@@ -55,8 +55,11 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [settingsTab, setSettingsTab] = useState<'record' | 'translate'>('record');
   const [history, setHistory] = useState<TranslationEntry[]>(loadHistory);
+  // Aligned with Rust AppSettings::default() — any drift here causes a flash
+  // between mount-time values and the ones returned by getSettings(), during
+  // which hooks like useGlobalHotkey could bind to the wrong hotkey.
   const [settings, setSettings] = useState<AppSettings>({
-    recording_mode: 'double_tap',
+    recording_mode: 'click_to_record',
     whisper_model: 'large-v3-turbo',
     source_language: 'auto',
     target_language: 'en',
@@ -65,7 +68,7 @@ function App() {
     translation_enabled: true,
     remove_filler_words: false,
     global_hotkey_enabled: false,
-    global_hotkey: 'Alt+Space',
+    global_hotkey: 'CommandOrControl+Shift+Space',
     double_tap_interval: 400,
     auto_paste_enabled: false,
     sound_feedback: false,
@@ -248,7 +251,7 @@ function App() {
       isHotkeyRecordingRef.current = false;
       handleStopRecording(wasHotkey);
     }
-  }, [setupNeeded, recordingState, startRecording, handleStopRecording]);
+  }, [setupNeeded, recordingState, startRecording, handleStopRecording, settings.sound_feedback]);
 
   const handleGlobalHotkeyPressed = useCallback(async () => {
     if (setupNeeded || recordingState !== 'idle') return;
