@@ -14,6 +14,7 @@
     "core:window:allow-hide",
     "core:window:allow-close",
     "core:event:default",
-    "macos-permissions:default"
+    "macos-permissions:default",
+    "process:default"
   ]
 }

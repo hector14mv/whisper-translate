@@ -157,6 +157,26 @@ body {
   color: var(--color-text-secondary);
   border-color: var(--color-border);
 }
+
+.settings-btn {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+.settings-btn:hover {
+  background: var(--color-surface-3);
+  color: var(--color-text-primary);
+  border-color: var(--color-border-hover);
+}
 .icon-btn.active {
   background: var(--color-red-dim);
   border-color: rgba(239, 68, 68, 0.3);
@@ -351,19 +371,64 @@ select.input-field option {
 }
 
 /* ============================== */
-/* History item                   */
+/* History entries                */
 /* ============================== */
-.history-item {
-  padding: 10px 12px;
-  border-radius: 8px;
+.history-entry {
+  border-radius: 10px;
   background: transparent;
   border: 1px solid transparent;
-  cursor: pointer;
-  transition: all 0.15s;
+  transition: all 0.2s ease;
+  overflow: hidden;
 }
-.history-item:hover {
-  background: var(--color-surface-2);
+.history-entry:hover {
+  background: var(--color-surface);
   border-color: var(--color-border);
+}
+.history-entry.expanded {
+  background: var(--color-surface);
+  border-color: var(--color-border);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.history-entry-header {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s;
+}
+
+.history-entry-body {
+  padding: 0 12px 12px;
+  animation: slideDown 0.2s ease;
+}
+
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Empty state icon */
+.history-empty-icon {
+  width: 56px;
+  height: 56px;
+  border-radius: 16px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 /* ============================== */
@@ -465,9 +530,63 @@ body.overlay-window {
 }
 
 /* ============================== */
+/* Segmented Control              */
+/* ============================== */
+.segmented-control {
+  display: flex;
+  position: relative;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 3px;
+  gap: 2px;
+}
+
+.segmented-indicator {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: calc(50% - 4px);
+  height: calc(100% - 6px);
+  background: var(--color-surface-3);
+  border-radius: 8px;
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+.segmented-btn {
+  flex: 1;
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border: none;
+  background: transparent;
+  color: var(--color-text-tertiary);
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: color 0.2s;
+  user-select: none;
+}
+
+.segmented-btn:hover {
+  color: var(--color-text-secondary);
+}
+
+.segmented-btn.active {
+  color: var(--color-text-primary);
+}
+
+/* ============================== */
 /* Section divider                */
 /* ============================== */
 .divider {
   height: 1px;
   background: var(--color-border);
 }
+

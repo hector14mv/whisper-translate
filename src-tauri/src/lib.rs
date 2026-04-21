@@ -10,9 +10,21 @@ use providers::{ModelInfo, ProviderConfig, TranslationProvider};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, RwLock};
+use tauri::menu::{CheckMenuItem, CheckMenuItemBuilder, MenuBuilder, MenuItem, MenuItemBuilder};
+use tauri::tray::TrayIconBuilder;
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use whisper_rs::WhisperContext;
+
+/// Tray menu state — keeps references to menu items so we can update them from commands
+pub struct TrayState {
+    pub record_item: MenuItem<tauri::Wry>,
+    pub auto_paste_item: CheckMenuItem<tauri::Wry>,
+    pub translation_item: CheckMenuItem<tauri::Wry>,
+    pub filler_words_item: CheckMenuItem<tauri::Wry>,
+    pub sound_feedback_item: CheckMenuItem<tauri::Wry>,
+}
 
 
 /// Application state shared across commands
@@ -27,6 +39,14 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// Cached Whisper context: (model_name, context) for cache invalidation on model change
     pub whisper_context: Mutex<Option<(String, WhisperContext)>>,
+    /// In-memory cache of AppSettings. Single source of truth — avoids reading
+    /// settings.json from disk on every hot-path call (e.g. copy_and_paste) and
+    /// serializes read-modify-write sequences from tray + frontend paths.
+    pub settings: RwLock<AppSettings>,
+    /// True once the user has explicitly chosen to quit. Used so
+    /// ExitRequested can prevent_exit only for "last window closed",
+    /// without eating a genuine quit.
+    pub quit_requested: AtomicBool,
     /// PID of the app that was frontmost when recording started
     #[cfg(target_os = "macos")]
     pub previous_app_pid: Mutex<Option<i32>>,
@@ -40,6 +60,8 @@ impl Default for AppState {
             whisper_model_path: Mutex::new(None),
             http_client: reqwest::Client::new(),
             whisper_context: Mutex::new(None),
+            settings: RwLock::new(load_settings_from_disk()),
+            quit_requested: AtomicBool::new(false),
             #[cfg(target_os = "macos")]
             previous_app_pid: Mutex::new(None),
         }
@@ -76,6 +98,10 @@ pub struct AppSettings {
     pub global_hotkey: String,            // The hotkey combination (e.g., "CommandOrControl+Shift+Space")
     #[serde(default = "default_double_tap_interval")]
     pub double_tap_interval: u32,         // Milliseconds between taps for double-tap mode
+    #[serde(default = "default_auto_paste")]
+    pub auto_paste_enabled: bool,         // Simulate Cmd+V after copying transcription
+    #[serde(default = "default_sound_feedback")]
+    pub sound_feedback: bool,             // Play system sounds on start/stop
 }
 
 fn default_translation_enabled() -> bool {
@@ -98,6 +124,14 @@ fn default_double_tap_interval() -> u32 {
     400
 }
 
+fn default_auto_paste() -> bool {
+    false
+}
+
+fn default_sound_feedback() -> bool {
+    false
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -112,6 +146,8 @@ impl Default for AppSettings {
             global_hotkey_enabled: false,
             global_hotkey: "CommandOrControl+Shift+Space".to_string(),
             double_tap_interval: 400,
+            auto_paste_enabled: false,
+            sound_feedback: false,
         }
     }
 }
@@ -200,34 +236,29 @@ fn get_settings_path() -> Result<PathBuf, String> {
     Ok(config_dir.join("settings.json"))
 }
 
-/// Get current app settings
-#[tauri::command]
-fn get_settings() -> AppSettings {
+/// Read settings.json from disk. Called exactly once at startup to seed the
+/// in-memory cache in `AppState::default()`.
+fn load_settings_from_disk() -> AppSettings {
     match get_settings_path() {
-        Ok(path) => {
-            if path.exists() {
-                match fs::read_to_string(&path) {
-                    Ok(content) => {
-                        match serde_json::from_str(&content) {
-                            Ok(settings) => {
-                                log::info!("Loaded settings from {:?}", path);
-                                settings
-                            }
-                            Err(e) => {
-                                log::warn!("Failed to parse settings file: {}. Using defaults.", e);
-                                AppSettings::default()
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to read settings file: {}. Using defaults.", e);
-                        AppSettings::default()
-                    }
+        Ok(path) if path.exists() => match fs::read_to_string(&path) {
+            Ok(content) => match serde_json::from_str(&content) {
+                Ok(settings) => {
+                    log::info!("Loaded settings from {:?}", path);
+                    settings
                 }
-            } else {
-                log::info!("No settings file found, using defaults");
+                Err(e) => {
+                    log::warn!("Failed to parse settings file: {}. Using defaults.", e);
+                    AppSettings::default()
+                }
+            },
+            Err(e) => {
+                log::warn!("Failed to read settings file: {}. Using defaults.", e);
                 AppSettings::default()
             }
+        },
+        Ok(_) => {
+            log::info!("No settings file found, using defaults");
+            AppSettings::default()
         }
         Err(e) => {
             log::warn!("Failed to get settings path: {}. Using defaults.", e);
@@ -236,16 +267,46 @@ fn get_settings() -> AppSettings {
     }
 }
 
-/// Save app settings
-#[tauri::command]
-fn save_settings(settings: AppSettings) -> Result<(), String> {
+fn write_settings_to_disk(settings: &AppSettings) -> Result<(), String> {
     let path = get_settings_path()?;
-    let content = serde_json::to_string_pretty(&settings)
+    let content = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("Failed to serialize settings: {}", e))?;
     fs::write(&path, content)
         .map_err(|e| format!("Failed to write settings file: {}", e))?;
     log::info!("Settings saved to {:?}", path);
     Ok(())
+}
+
+/// Atomically mutate and persist settings. Holds the write lock across the
+/// read-modify-write + disk flush so two concurrent toggles (tray + debounced
+/// frontend save) can't lose an update.
+fn update_settings_with<F>(state: &AppState, f: F) -> Result<AppSettings, String>
+where
+    F: FnOnce(&mut AppSettings),
+{
+    let mut guard = state.settings.write().unwrap_or_else(|e| e.into_inner());
+    f(&mut guard);
+    let snapshot = guard.clone();
+    write_settings_to_disk(&snapshot)?;
+    Ok(snapshot)
+}
+
+/// Get current app settings (reads from in-memory cache)
+#[tauri::command]
+fn get_settings(state: State<AppState>) -> AppSettings {
+    state
+        .settings
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Save app settings (updates cache, then persists to disk under the write lock)
+#[tauri::command]
+fn save_settings(settings: AppSettings, state: State<AppState>) -> Result<(), String> {
+    let mut guard = state.settings.write().unwrap_or_else(|e| e.into_inner());
+    *guard = settings.clone();
+    write_settings_to_disk(&settings)
 }
 
 /// Translate text using the specified provider
@@ -411,6 +472,26 @@ async fn copy_and_paste(text: String, app_handle: AppHandle, state: State<'_, Ap
         }
 
         log::info!("[PASTE] Focus switch dispatched: {:?}", t0.elapsed());
+
+        // Simulate Cmd+V if auto-paste is enabled. Give AppKit a beat to finish
+        // the focus switch so the synthesized keystroke lands in the right app.
+        // Read from the in-memory cache — no disk I/O on the hot path.
+        let auto_paste = state
+            .settings
+            .read()
+            .map(|s| s.auto_paste_enabled)
+            .unwrap_or(false);
+        if auto_paste {
+            tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+            // Run the sync CGEvent calls off the async worker so the 10ms gap
+            // between key_down / key_up doesn't stall the Tokio event loop.
+            let paste_result = tokio::task::spawn_blocking(simulate_paste_macos).await;
+            match paste_result {
+                Ok(Ok(())) => log::info!("[PASTE] Cmd+V simulated: {:?}", t0.elapsed()),
+                Ok(Err(e)) => log::warn!("[PASTE] Cmd+V simulation failed: {}", e),
+                Err(e) => log::warn!("[PASTE] Cmd+V spawn_blocking join failed: {}", e),
+            }
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -420,6 +501,141 @@ async fn copy_and_paste(text: String, app_handle: AppHandle, state: State<'_, Ap
         return Err("Focus switch only supported on macOS".to_string());
     }
 
+    Ok(())
+}
+
+// CGEventSource / CGEvent are not Send, so they can't cross a .await.
+// We keep this function sync and call it from a spawn_blocking task so the
+// 10ms gap between key_down and key_up runs off the async worker thread.
+#[cfg(target_os = "macos")]
+fn simulate_paste_macos() -> Result<(), String> {
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    // Key code for 'V' on macOS
+    const V_KEY: u16 = 9;
+
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| "Failed to create event source".to_string())?;
+
+    let key_down = CGEvent::new_keyboard_event(source.clone(), V_KEY, true)
+        .map_err(|_| "Failed to create key down event".to_string())?;
+
+    let key_up = CGEvent::new_keyboard_event(source, V_KEY, false)
+        .map_err(|_| "Failed to create key up event".to_string())?;
+
+    key_down.set_flags(CGEventFlags::CGEventFlagCommand);
+    key_up.set_flags(CGEventFlags::CGEventFlagCommand);
+
+    key_down.post(CGEventTapLocation::HID);
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    key_up.post(CGEventTapLocation::HID);
+
+    Ok(())
+}
+
+/// Sync auto-paste checkbox in tray with settings
+#[tauri::command]
+fn update_tray_auto_paste(enabled: bool, state: State<TrayState>) -> Result<(), String> {
+    state
+        .auto_paste_item
+        .set_checked(enabled)
+        .map_err(|e| format!("Failed to set auto paste: {}", e))?;
+    Ok(())
+}
+
+/// Sync sound feedback checkbox in tray with settings
+#[tauri::command]
+fn update_tray_sound_feedback(enabled: bool, state: State<TrayState>) -> Result<(), String> {
+    state
+        .sound_feedback_item
+        .set_checked(enabled)
+        .map_err(|e| format!("Failed to set sound feedback: {}", e))?;
+    Ok(())
+}
+
+/// Sync translation checkbox in tray with settings
+#[tauri::command]
+fn update_tray_translation(enabled: bool, state: State<TrayState>) -> Result<(), String> {
+    state
+        .translation_item
+        .set_checked(enabled)
+        .map_err(|e| format!("Failed to set translation: {}", e))?;
+    Ok(())
+}
+
+/// Sync filler words checkbox in tray with settings
+#[tauri::command]
+fn update_tray_filler_words(enabled: bool, state: State<TrayState>) -> Result<(), String> {
+    state
+        .filler_words_item
+        .set_checked(enabled)
+        .map_err(|e| format!("Failed to set filler words: {}", e))?;
+    Ok(())
+}
+
+/// Update the tray record item label (Record / Stop Recording)
+#[tauri::command]
+fn update_tray_record_label(is_recording: bool, state: State<TrayState>) -> Result<(), String> {
+    let label = if is_recording { "Stop Recording" } else { "Record" };
+    state
+        .record_item
+        .set_text(label)
+        .map_err(|e| format!("Failed to set record label: {}", e))?;
+    Ok(())
+}
+
+/// Update the tray record item hotkey display
+#[tauri::command]
+fn update_tray_hotkey(hotkey: Option<String>, state: State<TrayState>) -> Result<(), String> {
+    match hotkey {
+        Some(accel) => {
+            state
+                .record_item
+                .set_accelerator(Some(&accel))
+                .map_err(|e| format!("Failed to set accelerator: {}", e))?;
+        }
+        None => {
+            state
+                .record_item
+                .set_accelerator(None::<&str>)
+                .map_err(|e| format!("Failed to clear accelerator: {}", e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Play a macOS system sound. Name is whitelisted so a malicious frontend
+/// can't coax afplay into touching arbitrary filesystem paths via traversal.
+/// Uses Command::spawn() + detached Child (no blocking thread parked on output()).
+#[tauri::command]
+fn play_sound(name: String) -> Result<(), String> {
+    const ALLOWED: &[&str] = &[
+        "Tink", "Glass", "Pop", "Ping", "Funk", "Hero", "Morse", "Submarine", "Bottle",
+    ];
+    if !ALLOWED.contains(&name.as_str()) {
+        return Err(format!("Sound '{}' is not in the allow-list", name));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::{Command, Stdio};
+        let sound_path = format!("/System/Library/Sounds/{}.aiff", name);
+        // Fire-and-forget: spawn detaches the child; we don't wait, we don't
+        // park a thread, we don't leak a Child that still owns fds after
+        // afplay exits ~200ms later.
+        Command::new("afplay")
+            .arg(&sound_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn afplay: {}", e))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = name;
+    }
     Ok(())
 }
 
@@ -494,7 +710,163 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_macos_permissions::init())
+        .plugin(tauri_plugin_process::init())
         .manage(AppState::default())
+        .setup(|app| {
+            // Hide main window on startup (menu bar app style)
+            if let Some(main_window) = app.get_webview_window("main") {
+                let _ = main_window.hide();
+            }
+
+            // Snapshot the cached settings under a read lock — no disk I/O.
+            let settings = {
+                let state = app.state::<AppState>();
+                let guard = state.settings.read().unwrap_or_else(|e| e.into_inner());
+                guard.clone()
+            };
+
+            // Build native tray menu
+            let mut record_builder = MenuItemBuilder::with_id("record", "Record");
+            if settings.global_hotkey_enabled {
+                record_builder = record_builder.accelerator(&settings.global_hotkey);
+            }
+            let record_item = record_builder.build(app)?;
+            let auto_paste = CheckMenuItemBuilder::with_id("auto_paste", "Auto-paste")
+                .checked(settings.auto_paste_enabled)
+                .build(app)?;
+            let filler_words_item = CheckMenuItemBuilder::with_id("filler_words", "Remove Filler Words")
+                .checked(settings.remove_filler_words)
+                .build(app)?;
+            let translation_item = CheckMenuItemBuilder::with_id("translation", "Translate")
+                .checked(settings.translation_enabled)
+                .build(app)?;
+            let sound_feedback_item = CheckMenuItemBuilder::with_id("sound_feedback", "Sound Feedback")
+                .checked(settings.sound_feedback)
+                .build(app)?;
+
+            let history_item = MenuItemBuilder::with_id("history", "History").build(app)?;
+            let settings_item = MenuItemBuilder::with_id("settings", "Settings").build(app)?;
+            let restart_item = MenuItemBuilder::with_id("restart", "Restart App").build(app)?;
+            let quit_item = MenuItemBuilder::with_id("quit", "Quit App").build(app)?;
+
+            let menu = MenuBuilder::new(app)
+                .item(&record_item)
+                .separator()
+                .item(&auto_paste)
+                .item(&translation_item)
+                .item(&filler_words_item)
+                .item(&sound_feedback_item)
+                .separator()
+                .item(&history_item)
+                .item(&settings_item)
+                .separator()
+                .item(&restart_item)
+                .item(&quit_item)
+                .build()?;
+
+            app.manage(TrayState {
+                record_item: record_item.clone(),
+                auto_paste_item: auto_paste.clone(),
+                translation_item: translation_item.clone(),
+                filler_words_item: filler_words_item.clone(),
+                sound_feedback_item: sound_feedback_item.clone(),
+            });
+
+            // Helper: focus-then-emit ordering for tray → webview navigation.
+            // Showing before emitting ensures the listener is mounted when the
+            // event fires, killing the timing-based sleep(50ms) hack.
+            fn focus_then_emit(app: &AppHandle, event_name: &'static str) {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                    let _ = window.emit(event_name, ());
+                }
+            }
+
+            let _tray = TrayIconBuilder::new()
+                .icon(
+                    app.default_window_icon()
+                        .ok_or("No default window icon configured in tauri.conf.json")?
+                        .clone(),
+                )
+                .tooltip("Whisper Translate")
+                .menu(&menu)
+                .show_menu_on_left_click(true)
+                .on_menu_event(move |app, event| match event.id().as_ref() {
+                    "record" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.emit("tray-record-toggle", ());
+                        }
+                    }
+                    "translation" => {
+                        let state = app.state::<AppState>();
+                        let currently_enabled = state
+                            .settings
+                            .read()
+                            .map(|s| s.translation_enabled)
+                            .unwrap_or(false);
+
+                        if !currently_enabled {
+                            // Enabling — verify a usable provider is configured.
+                            // (Ollama is assumed reachable and validated lazily on first translate.)
+                            let provider = state
+                                .settings
+                                .read()
+                                .map(|s| s.translation_provider.clone())
+                                .unwrap_or_default();
+                            let has_provider = match provider.as_str() {
+                                "ollama" => true,
+                                "anthropic" => keychain::get_api_key_value("anthropic").is_some(),
+                                "openai" => keychain::get_api_key_value("openai").is_some(),
+                                "google" => keychain::get_api_key_value("google").is_some(),
+                                _ => false,
+                            };
+                            if !has_provider {
+                                if let Some(tray_state) = app.try_state::<TrayState>() {
+                                    let _ = tray_state.translation_item.set_checked(false);
+                                }
+                                focus_then_emit(app, "tray-open-settings-translate");
+                                return;
+                            }
+                        }
+
+                        // Atomic flip of translation_enabled + persist.
+                        let _ = update_settings_with(&state, |s| {
+                            s.translation_enabled = !currently_enabled;
+                        });
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.emit("tray-settings-changed", ());
+                        }
+                    }
+                    id @ ("auto_paste" | "filler_words" | "sound_feedback") => {
+                        let state = app.state::<AppState>();
+                        let _ = update_settings_with(&state, |s| match id {
+                            "auto_paste" => s.auto_paste_enabled = !s.auto_paste_enabled,
+                            "filler_words" => s.remove_filler_words = !s.remove_filler_words,
+                            "sound_feedback" => s.sound_feedback = !s.sound_feedback,
+                            _ => {}
+                        });
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.emit("tray-settings-changed", ());
+                        }
+                    }
+                    "history" => focus_then_emit(app, "tray-open-history"),
+                    "settings" => focus_then_emit(app, "tray-open-settings"),
+                    "restart" => {
+                        app.state::<AppState>().quit_requested.store(true, Ordering::SeqCst);
+                        app.restart();
+                    }
+                    "quit" => {
+                        app.state::<AppState>().quit_requested.store(true, Ordering::SeqCst);
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .build(app)?;
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             // Audio commands
             start_recording,
@@ -524,7 +896,41 @@ pub fn run() {
             // Overlay commands
             show_overlay,
             hide_overlay,
+            // Tray sync commands
+            update_tray_hotkey,
+            update_tray_filler_words,
+            update_tray_auto_paste,
+            update_tray_translation,
+            update_tray_sound_feedback,
+            update_tray_record_label,
+            play_sound,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                // Only swallow implicit exits (last window closed). A user-
+                // initiated Quit flips quit_requested first and goes through.
+                let quit_requested = app
+                    .state::<AppState>()
+                    .quit_requested
+                    .load(Ordering::SeqCst);
+                if !quit_requested {
+                    api.prevent_exit();
+                }
+            }
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::CloseRequested { api, .. },
+                ..
+            } => {
+                if label == "main" {
+                    api.prevent_close();
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.hide();
+                    }
+                }
+            }
+            _ => {}
+        });
 }
